@@ -1,13 +1,195 @@
 import os
+import time
 from decimal import Decimal
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
 from hummingbot.client.hummingbot_application import HummingbotApplication
 from hummingbot.connector.connector_base import ConnectorBase
-from hummingbot.core.event.events import MarketOrderFailureEvent
+from hummingbot.core.data_type.common import OrderType, TradeType
+from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState
+from hummingbot.core.event.events import (
+    BuyOrderCompletedEvent,
+    MarketOrderFailureEvent,
+    OrderCancelledEvent,
+    OrderFilledEvent,
+    SellOrderCompletedEvent,
+)
 from hummingbot.strategy.strategy_v2_base import StrategyV2Base, StrategyV2ConfigBase
+from hummingbot.strategy_v2.executors.executor_base import ExecutorBase
+from hummingbot.strategy_v2.executors.xemm_executor.xemm_executor import XEMMExecutor
 from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, StopExecutorAction
+from hummingbot.strategy_v2.models.executors import TrackedOrder
+
+# Compatibility patch for PaperTradeExchange (which doesn't implement in_flight_orders or _order_tracker)
+_paper_trade_orders: Dict[str, InFlightOrder] = {}
+
+
+def _safe_get_in_flight_order(self, connector_name: str, order_id: str):
+    connector = self.connectors.get(connector_name)
+    if not connector:
+        return _paper_trade_orders.get(order_id)
+
+    # 1. Try real connector's _order_tracker
+    try:
+        if hasattr(connector, "_order_tracker") and connector._order_tracker is not None:
+            order = connector._order_tracker.fetch_order(client_order_id=order_id)
+            if order is not None:
+                return order
+    except Exception:
+        pass
+
+    # 2. Try real connector's in_flight_orders property safely (avoiding NotImplementedError)
+    try:
+        in_flight = getattr(connector, "in_flight_orders", None)
+        if in_flight is not None:
+            order = in_flight.get(order_id)
+            if order is not None:
+                return order
+    except Exception:
+        pass
+
+    # 3. Check cached paper trade orders
+    if order_id in _paper_trade_orders:
+        return _paper_trade_orders[order_id]
+
+    # 4. Check paper trade connector's limit_orders
+    try:
+        if hasattr(connector, "limit_orders"):
+            for lo in connector.limit_orders:
+                if lo.client_order_id == order_id:
+                    created_ts = float(lo.creation_timestamp)
+                    if created_ts > 1e11:
+                        created_ts = created_ts / 1e6
+                    order = InFlightOrder(
+                        client_order_id=lo.client_order_id,
+                        trading_pair=lo.trading_pair,
+                        order_type=OrderType.LIMIT,
+                        trade_type=TradeType.BUY if lo.is_buy else TradeType.SELL,
+                        amount=Decimal(str(lo.quantity)),
+                        creation_timestamp=created_ts,
+                        price=Decimal(str(lo.price)),
+                        initial_state=OrderState.OPEN,
+                    )
+                    _paper_trade_orders[order_id] = order
+                    return order
+    except Exception:
+        pass
+
+    # 5. Create a placeholder InFlightOrder for paper trade if not found
+    order = InFlightOrder(
+        client_order_id=order_id,
+        trading_pair="",
+        order_type=OrderType.MARKET,
+        trade_type=TradeType.BUY,
+        amount=Decimal("0"),
+        creation_timestamp=time.time(),
+        price=Decimal("0"),
+        initial_state=OrderState.OPEN,
+    )
+    _paper_trade_orders[order_id] = order
+    return order
+
+
+ExecutorBase.get_in_flight_order = _safe_get_in_flight_order
+
+# Patch TrackedOrder so properties safely fall back to _paper_trade_orders
+_orig_tracked_is_done = TrackedOrder.is_done
+_orig_tracked_is_open = TrackedOrder.is_open
+_orig_tracked_price = TrackedOrder.price
+
+
+def _safe_tracked_order_is_done(self):
+    if self.order:
+        return self.order.is_done
+    if self.order_id and self.order_id in _paper_trade_orders:
+        return _paper_trade_orders[self.order_id].is_done
+    return False
+
+
+def _safe_tracked_order_is_open(self):
+    if self.order:
+        return self.order.is_open
+    if self.order_id and self.order_id in _paper_trade_orders:
+        return _paper_trade_orders[self.order_id].is_open
+    return False
+
+
+def _safe_tracked_order_price(self):
+    if self.order:
+        return self.order.price
+    if self.order_id and self.order_id in _paper_trade_orders:
+        return _paper_trade_orders[self.order_id].price
+    return None
+
+
+if not hasattr(TrackedOrder, "_is_safe_patched"):
+    _orig_tracked_is_done = TrackedOrder.is_done
+    _orig_tracked_is_open = TrackedOrder.is_open
+    _orig_tracked_price = TrackedOrder.price
+
+    TrackedOrder.is_done = property(_safe_tracked_order_is_done)
+    TrackedOrder.is_open = property(_safe_tracked_order_is_open)
+    TrackedOrder.price = property(_safe_tracked_order_price)
+    TrackedOrder._is_safe_patched = True
+
+# Proxy detection and aiohttp monkey patch for WebSocket / REST connections
+import socket
+from urllib.parse import urlparse
+import aiohttp
+
+
+def _find_working_proxy() -> Optional[str]:
+    candidates = []
+    for env_var in ["HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"]:
+        val = os.environ.get(env_var)
+        if val:
+            candidates.append(val)
+    candidates.extend([
+        "http://192.168.65.254:10808",
+        "http://192.168.65.254:7890",
+        "http://127.0.0.1:10808",
+        "http://127.0.0.1:7890",
+    ])
+    for cand in candidates:
+        try:
+            parsed = urlparse(cand)
+            host = parsed.hostname
+            port = parsed.port or 80
+            if host and port:
+                s = socket.create_connection((host, port), timeout=0.3)
+                s.close()
+                return cand
+        except Exception:
+            continue
+    return None
+
+
+_active_proxy = _find_working_proxy()
+if _active_proxy:
+    os.environ["HTTP_PROXY"] = _active_proxy
+    os.environ["HTTPS_PROXY"] = _active_proxy
+
+if not hasattr(aiohttp.ClientSession, "_raw_ws_connect"):
+    aiohttp.ClientSession._raw_init = aiohttp.ClientSession.__init__
+    aiohttp.ClientSession._raw_ws_connect = aiohttp.ClientSession.ws_connect
+
+    def _safe_aiohttp_session_init(self, *args, **kwargs):
+        if "trust_env" not in kwargs:
+            kwargs["trust_env"] = True
+        return aiohttp.ClientSession._raw_init(self, *args, **kwargs)
+
+    def _safe_aiohttp_ws_connect(self, url, *args, **kwargs):
+        if _active_proxy and "proxy" not in kwargs:
+            kwargs["proxy"] = _active_proxy
+        if kwargs.get("max_msg_size") is None:
+            kwargs["max_msg_size"] = 4 * 1024 * 1024
+        return aiohttp.ClientSession._raw_ws_connect(self, url, *args, **kwargs)
+
+    aiohttp.ClientSession.__init__ = _safe_aiohttp_session_init
+    aiohttp.ClientSession.ws_connect = _safe_aiohttp_ws_connect
+
+
 
 
 class V2WithControllersConfig(StrategyV2ConfigBase):

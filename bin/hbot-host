@@ -36,6 +36,16 @@ fi
 #    and set PATH/CONDA_PREFIX ourselves so the CLI and its subprocesses still run inside the env, and
 #    the CLI's real exit code passes straight through. Run the INSTALLED package (via conda develop) —
 #    not the name `hbot` (would re-resolve to this wrapper and recurse).
+if [ "$prefer" != "docker" ]; then
+    if ! command -v conda >/dev/null 2>&1; then
+        for p in "$HOME/miniforge3/bin" "$HOME/miniconda3/bin" "$HOME/anaconda3/bin" /opt/conda/bin; do
+            if [ -x "$p/conda" ]; then
+                export PATH="$p:$PATH"
+                break
+            fi
+        done
+    fi
+fi
 if [ "$prefer" != "docker" ] && command -v conda >/dev/null 2>&1; then
     prefix="$(conda env list | awk '$1=="hummingbot"{print $NF}')"
     if [ -n "$prefix" ] && [ -x "$prefix/bin/python" ]; then

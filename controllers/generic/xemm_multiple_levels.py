@@ -78,17 +78,20 @@ class XEMMMultipleLevels(ControllerBase):
 
     def initialize_rate_sources(self):
         rates_required = []
-        for connector_pair in [
-            ConnectorPair(connector_name=self.config.maker_connector, trading_pair=self.config.maker_trading_pair),
-            ConnectorPair(connector_name=self.config.taker_connector, trading_pair=self.config.taker_trading_pair)
+        clean_maker = self.config.maker_connector.replace("_paper_trade", "")
+        clean_taker = self.config.taker_connector.replace("_paper_trade", "")
+        for connector_name, trading_pair in [
+            (clean_maker, self.config.maker_trading_pair),
+            (clean_taker, self.config.taker_trading_pair),
         ]:
+            connector_pair = ConnectorPair(connector_name=connector_name, trading_pair=trading_pair)
             base, quote = connector_pair.trading_pair.split("-")
 
             # Add rate source for gas token if it's an AMM connector
             if connector_pair.is_amm_connector():
                 gas_token = self.get_gas_token(connector_pair.connector_name)
                 if gas_token and gas_token != base and gas_token != quote:
-                    rates_required.append(ConnectorPair(connector_name=self.config.maker_connector,
+                    rates_required.append(ConnectorPair(connector_name=connector_name,
                                                         trading_pair=f"{base}-{gas_token}"))
 
             # Add rate source for trading pairs

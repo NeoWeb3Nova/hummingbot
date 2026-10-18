@@ -324,7 +324,19 @@ class ExecutorBase(RunnableBase):
         :param order_id: The ID of the order.
         :return: The in-flight order.
         """
-        return self.connectors[connector_name]._order_tracker.fetch_order(client_order_id=order_id)
+        connector = self.connectors[connector_name]
+        try:
+            if hasattr(connector, "_order_tracker") and connector._order_tracker is not None:
+                return connector._order_tracker.fetch_order(client_order_id=order_id)
+        except Exception:
+            pass
+        try:
+            in_flight = getattr(connector, "in_flight_orders", None)
+            if in_flight is not None:
+                return in_flight.get(order_id)
+        except Exception:
+            pass
+        return None
 
     def register_events(self):
         """
