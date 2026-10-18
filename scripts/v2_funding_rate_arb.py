@@ -167,8 +167,186 @@ class FundingRateArbitrage(StrategyV2Base):
         :param clock: Clock to use.
         :param timestamp: Current time.
         """
+        super().start(clock, timestamp)
         self._last_timestamp = timestamp
         self.apply_initial_setting()
+        try:
+            from hummingbot.client.hummingbot_application import HummingbotApplication
+            app = HummingbotApplication.main_application()
+            if app and getattr(app, "_mqtt", None) is not None:
+                from hummingbot.remote_iface.mqtt import ETopicPublisher
+                self.mqtt_enabled = True
+                self._pub = ETopicPublisher("performance", use_bot_prefix=True)
+                self.logger().info("[DRY-RUN] Initialized MQTT publisher for live UI performance stream.")
+        except Exception as e:
+            self.logger().debug(f"MQTT publisher not initialized: {e}")
+
+    def on_tick(self):
+        if self.ready_to_trade and self.market_data_provider.ready and not getattr(self, "_is_stop_triggered", False):
+            actions = self.determine_executor_actions()
+            for action in actions:
+                self.executor_orchestrator.execute_action(action)
+            self.publish_arbitrage_performance()
+
+    def publish_arbitrage_performance(self):
+        """
+        Aggregate and publish real-time arbitrage performance and trade details via MQTT and local disk.
+        """
+        now = self.current_timestamp
+        active_list = []
+        total_unrealized_pnl = Decimal("0")
+        total_funding_pnl = Decimal("0")
+        total_volume = Decimal("0")
+
+        for token, arb in self.active_funding_arbitrages.items():
+            funding_income = sum(Decimal(str(p.get("amount", 0))) for p in arb.get("funding_payments", []))
+            total_funding_pnl += funding_income
+            pos_size = Decimal(str(arb.get("position_size_quote", self.config.position_size_quote)))
+            total_volume += pos_size * 2
+
+            p1_curr = Decimal(str(arb.get("price_1", 0)))
+            p2_curr = Decimal(str(arb.get("price_2", 0)))
+            unrealized_trading_pnl = Decimal("0")
+
+            try:
+                trading_pair_1 = self.get_trading_pair_for_connector(token, arb["connector_1"])
+                trading_pair_2 = self.get_trading_pair_for_connector(token, arb["connector_2"])
+                p1_curr = Decimal(str(self.market_data_provider.get_price_by_type(
+                    connector_name=arb["connector_1"],
+                    trading_pair=trading_pair_1,
+                    price_type=PriceType.MidPrice
+                )))
+                p2_curr = Decimal(str(self.market_data_provider.get_price_by_type(
+                    connector_name=arb["connector_2"],
+                    trading_pair=trading_pair_2,
+                    price_type=PriceType.MidPrice
+                )))
+                amt1 = arb.get("amount_1", pos_size / p1_curr)
+                amt2 = arb.get("amount_2", pos_size / p2_curr)
+                p1_open = arb.get("price_1", p1_curr)
+                p2_open = arb.get("price_2", p2_curr)
+
+                leg1_pnl = (p1_curr - p1_open) * amt1 if arb["side"] == TradeType.BUY else (p1_open - p1_curr) * amt1
+                leg2_pnl = (p2_open - p2_curr) * amt2 if arb["side"] == TradeType.BUY else (p2_curr - p2_open) * amt2
+                unrealized_trading_pnl = leg1_pnl + leg2_pnl
+            except Exception:
+                pass
+
+            total_unrealized_pnl += unrealized_trading_pnl
+            net_position_pnl = unrealized_trading_pnl + funding_income
+            elapsed_sec = max(0, now - arb.get("open_timestamp", now))
+
+            active_list.append({
+                "token": token,
+                "connector_1": arb["connector_1"],
+                "connector_2": arb["connector_2"],
+                "side": arb["side"].name if hasattr(arb["side"], "name") else str(arb["side"]),
+                "entry_price_1": float(arb.get("price_1", 0)),
+                "entry_price_2": float(arb.get("price_2", 0)),
+                "current_price_1": float(p1_curr),
+                "current_price_2": float(p2_curr),
+                "position_size": float(pos_size),
+                "funding_income": float(funding_income),
+                "settlement_count": len(arb.get("funding_payments", [])),
+                "unrealized_trading_pnl": float(unrealized_trading_pnl),
+                "net_pnl": float(net_position_pnl),
+                "net_pnl_pct": float(net_position_pnl / pos_size) if pos_size else 0.0,
+                "duration_seconds": int(elapsed_sec),
+                "next_funding_1": int(arb.get("next_funding_time_1", 0)),
+                "next_funding_2": int(arb.get("next_funding_time_2", 0)),
+            })
+
+        # Closed trades
+        closed_list = []
+        total_realized_pnl = Decimal("0")
+        tp_count = 0
+        sl_count = 0
+
+        for token, pos_list in self.stopped_funding_arbitrages.items():
+            for pos in pos_list:
+                t_pnl = Decimal(str(pos.get("trading_pnl", 0)))
+                f_pnl = Decimal(str(pos.get("funding_pnl", 0)))
+                tot_pnl = Decimal(str(pos.get("total_net_pnl", t_pnl + f_pnl)))
+                total_realized_pnl += tot_pnl
+                reason = pos.get("close_reason", "Completed")
+                if "Take Profit" in reason:
+                    tp_count += 1
+                elif "Stop Loss" in reason:
+                    sl_count += 1
+                closed_list.append({
+                    "token": token,
+                    "connector_1": pos.get("connector_1", ""),
+                    "connector_2": pos.get("connector_2", ""),
+                    "close_reason": reason,
+                    "close_timestamp": int(pos.get("close_timestamp", 0)),
+                    "open_timestamp": int(pos.get("open_timestamp", 0)),
+                    "trading_pnl": float(t_pnl),
+                    "funding_pnl": float(f_pnl),
+                    "total_net_pnl": float(tot_pnl),
+                })
+
+        # Live Market Comparison across watched tokens
+        market_list = []
+        try:
+            for token in self.config.tokens:
+                f_report = self.get_funding_info_by_token(token)
+                best_comb = self.get_most_profitable_combination(f_report)
+                row = {"token": token}
+                for c_name, c_info in f_report.items():
+                    norm_rate = self.get_normalized_funding_rate_in_seconds(f_report, c_name) * self.funding_profitability_interval * 100
+                    row[f"{c_name}_rate_daily"] = float(norm_rate)
+                    row[f"{c_name}_next_funding"] = int(c_info.next_funding_utc_timestamp)
+                if best_comb:
+                    c1, c2, side, diff = best_comb
+                    row["best_path"] = f"{c1} -> {c2}"
+                    row["daily_rate_diff_pct"] = float(diff * 100)
+                market_list.append(row)
+        except Exception:
+            pass
+
+        global_pnl = total_realized_pnl + total_unrealized_pnl + total_funding_pnl
+
+        report = {
+            "funding_rate_arb": {
+                "controller_name": "funding_rate_arb",
+                "trading_pair": ",".join(self.config.tokens),
+                "connector_name": ",".join(self.config.connectors),
+                "performance": {
+                    "realized_pnl_quote": float(total_realized_pnl),
+                    "unrealized_pnl_quote": float(total_unrealized_pnl + total_funding_pnl),
+                    "global_pnl_quote": float(global_pnl),
+                    "volume_traded": float(total_volume),
+                    "close_type_counts": {
+                        "CloseType.TAKE_PROFIT": tp_count,
+                        "CloseType.STOP_LOSS": sl_count,
+                    }
+                },
+                "custom_info": {
+                    "is_dry_run": bool(self.config.dry_run),
+                    "active_positions": active_list,
+                    "closed_trades": closed_list,
+                    "market_comparison": market_list,
+                }
+            }
+        }
+
+        # 1. Publish via MQTT if available
+        if getattr(self, "_pub", None):
+            try:
+                self._pub(report)
+            except Exception as e:
+                self.logger().debug(f"Failed to publish arbitrage performance via MQTT: {e}")
+
+        # 2. Persist local JSON copy to data directory for instant UI read
+        try:
+            import json
+            data_dir = getattr(self.client_config_map, "data_file_path", None) or "/home/hummingbot/data"
+            if os.path.isdir(data_dir):
+                json_path = os.path.join(data_dir, "arbitrage_trades.json")
+                with open(json_path, "w") as f:
+                    json.dump(report["funding_rate_arb"]["custom_info"], f)
+        except Exception:
+            pass
 
     def apply_initial_setting(self):
         if self.config.dry_run:
