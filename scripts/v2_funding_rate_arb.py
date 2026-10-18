@@ -1,3 +1,4 @@
+import math
 import os
 import time
 from decimal import Decimal
@@ -423,6 +424,45 @@ class FundingRateArbitrage(StrategyV2Base):
             funding_rates[connector_name] = connector.get_funding_info(trading_pair)
         return funding_rates
 
+    def get_safe_quote_price(self, connector_name: str, trading_pair: str, quote_volume: Decimal, is_buy: bool, fallback_price: Decimal = None) -> Decimal:
+        """
+        Safely retrieve price for quote volume. If orderbook depth is insufficient or returns NaN,
+        fall back to MidPrice, LastTradePrice, or fallback_price. Never returns NaN.
+        """
+        try:
+            res = self.market_data_provider.get_price_for_quote_volume(
+                connector_name=connector_name,
+                trading_pair=trading_pair,
+                quote_volume=float(quote_volume),
+                is_buy=is_buy,
+            )
+            p = res.result_price
+            if p is not None and not math.isnan(p) and p > 0:
+                return Decimal(str(p))
+        except Exception:
+            pass
+
+        # Try MidPrice
+        try:
+            mid = self.market_data_provider.get_price_by_type(connector_name, trading_pair, PriceType.MidPrice)
+            if mid is not None and not math.isnan(float(mid)) and float(mid) > 0:
+                return Decimal(str(mid))
+        except Exception:
+            pass
+
+        # Try LastTradePrice
+        try:
+            last = self.market_data_provider.get_price_by_type(connector_name, trading_pair, PriceType.LastTradePrice)
+            if last is not None and not math.isnan(float(last)) and float(last) > 0:
+                return Decimal(str(last))
+        except Exception:
+            pass
+
+        if fallback_price is not None and not fallback_price.is_nan() and fallback_price > 0:
+            return fallback_price
+
+        return Decimal("1")
+
     def get_current_profitability_after_fees(self, token: str, connector_1: str, connector_2: str, side: TradeType):
         """
         This methods compares the profitability of buying at market in the two exchanges. If the side is TradeType.BUY
@@ -431,18 +471,18 @@ class FundingRateArbitrage(StrategyV2Base):
         trading_pair_1 = self.get_trading_pair_for_connector(token, connector_1)
         trading_pair_2 = self.get_trading_pair_for_connector(token, connector_2)
 
-        connector_1_price = Decimal(self.market_data_provider.get_price_for_quote_volume(
+        connector_1_price = self.get_safe_quote_price(
             connector_name=connector_1,
             trading_pair=trading_pair_1,
             quote_volume=self.config.position_size_quote,
             is_buy=side == TradeType.BUY,
-        ).result_price)
-        connector_2_price = Decimal(self.market_data_provider.get_price_for_quote_volume(
+        )
+        connector_2_price = self.get_safe_quote_price(
             connector_name=connector_2,
             trading_pair=trading_pair_2,
             quote_volume=self.config.position_size_quote,
             is_buy=side != TradeType.BUY,
-        ).result_price)
+        )
         estimated_fees_connector_1 = self.connectors[connector_1].get_fee(
             base_currency=trading_pair_1.split("-")[0],
             quote_currency=trading_pair_1.split("-")[1],
@@ -570,18 +610,18 @@ class FundingRateArbitrage(StrategyV2Base):
                         # Open Virtual Position in Sandbox
                         trading_pair_1 = self.get_trading_pair_for_connector(token, connector_1)
                         trading_pair_2 = self.get_trading_pair_for_connector(token, connector_2)
-                        p1 = Decimal(str(self.market_data_provider.get_price_for_quote_volume(
+                        p1 = self.get_safe_quote_price(
                             connector_name=connector_1,
                             trading_pair=trading_pair_1,
                             quote_volume=self.config.position_size_quote,
                             is_buy=trade_side == TradeType.BUY,
-                        ).result_price))
-                        p2 = Decimal(str(self.market_data_provider.get_price_for_quote_volume(
+                        )
+                        p2 = self.get_safe_quote_price(
                             connector_name=connector_2,
                             trading_pair=trading_pair_2,
                             quote_volume=self.config.position_size_quote,
                             is_buy=trade_side != TradeType.BUY,
-                        ).result_price))
+                        )
                         fee_pct_1 = self.connectors[connector_1].get_fee(
                             base_currency=trading_pair_1.split("-")[0],
                             quote_currency=trading_pair_1.split("-")[1],
@@ -656,61 +696,75 @@ class FundingRateArbitrage(StrategyV2Base):
 
         stop_executor_actions = []
         for token, funding_arbitrage_info in list(self.active_funding_arbitrages.items()):
-            if funding_arbitrage_info.get("is_virtual"):
-                # Handle Virtual Position Exit Logic
-                trading_pair_1 = self.get_trading_pair_for_connector(token, funding_arbitrage_info["connector_1"])
-                trading_pair_2 = self.get_trading_pair_for_connector(token, funding_arbitrage_info["connector_2"])
-                p1_curr = Decimal(str(self.market_data_provider.get_price_for_quote_volume(
-                    connector_name=funding_arbitrage_info["connector_1"],
-                    trading_pair=trading_pair_1,
-                    quote_volume=funding_arbitrage_info["position_size_quote"],
-                    is_buy=funding_arbitrage_info["side"] != TradeType.BUY,
-                ).result_price))
-                p2_curr = Decimal(str(self.market_data_provider.get_price_for_quote_volume(
-                    connector_name=funding_arbitrage_info["connector_2"],
-                    trading_pair=trading_pair_2,
-                    quote_volume=funding_arbitrage_info["position_size_quote"],
-                    is_buy=funding_arbitrage_info["side"] == TradeType.BUY,
-                ).result_price))
+            try:
+                if funding_arbitrage_info.get("is_virtual"):
+                    # Handle Virtual Position Exit Logic
+                    trading_pair_1 = self.get_trading_pair_for_connector(token, funding_arbitrage_info["connector_1"])
+                    trading_pair_2 = self.get_trading_pair_for_connector(token, funding_arbitrage_info["connector_2"])
 
-                amt1 = funding_arbitrage_info["amount_1"]
-                p1_open = funding_arbitrage_info["price_1"]
-                leg1_pnl = (p1_curr - p1_open) * amt1 if funding_arbitrage_info["side"] == TradeType.BUY else (p1_open - p1_curr) * amt1
+                    p1_open = Decimal(str(funding_arbitrage_info.get("price_1", 1)))
+                    p2_open = Decimal(str(funding_arbitrage_info.get("price_2", 1)))
+                    pos_size = Decimal(str(funding_arbitrage_info.get("position_size_quote", self.config.position_size_quote)))
 
-                amt2 = funding_arbitrage_info["amount_2"]
-                p2_open = funding_arbitrage_info["price_2"]
-                leg2_pnl = (p2_open - p2_curr) * amt2 if funding_arbitrage_info["side"] == TradeType.BUY else (p2_curr - p2_open) * amt2
-
-                exit_fee_quote = funding_arbitrage_info.get("entry_fee_quote", Decimal("0"))
-                trading_pnl = leg1_pnl + leg2_pnl - exit_fee_quote
-                funding_pnl = sum(p["amount"] for p in funding_arbitrage_info["funding_payments"])
-                total_net_pnl = trading_pnl + funding_pnl
-                total_pnl_pct = total_net_pnl / funding_arbitrage_info["position_size_quote"]
-
-                take_profit_condition = total_net_pnl > self.config.profitability_to_take_profit * funding_arbitrage_info["position_size_quote"]
-
-                funding_info_report = self.get_funding_info_by_token(token)
-                rate1 = self.get_normalized_funding_rate_in_seconds(funding_info_report, funding_arbitrage_info["connector_1"])
-                rate2 = self.get_normalized_funding_rate_in_seconds(funding_info_report, funding_arbitrage_info["connector_2"])
-                if funding_arbitrage_info["side"] == TradeType.BUY:
-                    funding_rate_diff = rate2 - rate1
-                else:
-                    funding_rate_diff = rate1 - rate2
-                current_funding_condition = funding_rate_diff * self.funding_profitability_interval < self.config.funding_rate_diff_stop_loss
-
-                if take_profit_condition or current_funding_condition:
-                    reason = "Take Profit" if take_profit_condition else "Stop Loss"
-                    self.logger().info(
-                        f"[DRY-RUN] Virtual Arbitrage Closed ({reason}) for {token}!\n"
-                        f"  Trading PnL: {trading_pnl:+.4f}, Funding PnL: {funding_pnl:+.4f}, Total Net PnL: {total_net_pnl:+.4f} ({total_pnl_pct:+.2%})"
+                    p1_curr = self.get_safe_quote_price(
+                        connector_name=funding_arbitrage_info["connector_1"],
+                        trading_pair=trading_pair_1,
+                        quote_volume=pos_size,
+                        is_buy=funding_arbitrage_info["side"] != TradeType.BUY,
+                        fallback_price=p1_open,
                     )
-                    funding_arbitrage_info["close_timestamp"] = self.current_timestamp
-                    funding_arbitrage_info["trading_pnl"] = trading_pnl
-                    funding_arbitrage_info["funding_pnl"] = funding_pnl
-                    funding_arbitrage_info["total_net_pnl"] = total_net_pnl
-                    funding_arbitrage_info["close_reason"] = reason
-                    self.stopped_funding_arbitrages[token].append(funding_arbitrage_info)
-                    del self.active_funding_arbitrages[token]
+                    p2_curr = self.get_safe_quote_price(
+                        connector_name=funding_arbitrage_info["connector_2"],
+                        trading_pair=trading_pair_2,
+                        quote_volume=pos_size,
+                        is_buy=funding_arbitrage_info["side"] == TradeType.BUY,
+                        fallback_price=p2_open,
+                    )
+
+                    amt1 = Decimal(str(funding_arbitrage_info.get("amount_1", pos_size / p1_open)))
+                    amt2 = Decimal(str(funding_arbitrage_info.get("amount_2", pos_size / p2_open)))
+
+                    leg1_pnl = (p1_curr - p1_open) * amt1 if funding_arbitrage_info["side"] == TradeType.BUY else (p1_open - p1_curr) * amt1
+                    leg2_pnl = (p2_open - p2_curr) * amt2 if funding_arbitrage_info["side"] == TradeType.BUY else (p2_curr - p2_open) * amt2
+
+                    exit_fee_quote = Decimal(str(funding_arbitrage_info.get("entry_fee_quote", 0)))
+                    trading_pnl = leg1_pnl + leg2_pnl - exit_fee_quote
+                    funding_pnl = sum(Decimal(str(p.get("amount", 0))) for p in funding_arbitrage_info.get("funding_payments", []))
+                    total_net_pnl = trading_pnl + funding_pnl
+                    if total_net_pnl.is_nan():
+                        total_net_pnl = Decimal("0")
+                    total_pnl_pct = total_net_pnl / pos_size if pos_size > 0 else Decimal("0")
+
+                    take_profit_target = Decimal(str(self.config.profitability_to_take_profit)) * pos_size
+                    take_profit_condition = (not total_net_pnl.is_nan()) and (total_net_pnl > take_profit_target)
+
+                    funding_info_report = self.get_funding_info_by_token(token)
+                    rate1 = self.get_normalized_funding_rate_in_seconds(funding_info_report, funding_arbitrage_info["connector_1"])
+                    rate2 = self.get_normalized_funding_rate_in_seconds(funding_info_report, funding_arbitrage_info["connector_2"])
+                    if funding_arbitrage_info["side"] == TradeType.BUY:
+                        funding_rate_diff = rate2 - rate1
+                    else:
+                        funding_rate_diff = rate1 - rate2
+
+                    diff_val = funding_rate_diff * self.funding_profitability_interval
+                    stop_loss_target = Decimal(str(self.config.funding_rate_diff_stop_loss))
+                    current_funding_condition = (not diff_val.is_nan()) and (diff_val < stop_loss_target)
+
+                    if take_profit_condition or current_funding_condition:
+                        reason = "Take Profit" if take_profit_condition else "Stop Loss"
+                        self.logger().info(
+                            f"[DRY-RUN] Virtual Arbitrage Closed ({reason}) for {token}!\n"
+                            f"  Trading PnL: {trading_pnl:+.4f}, Funding PnL: {funding_pnl:+.4f}, Total Net PnL: {total_net_pnl:+.4f} ({total_pnl_pct:+.2%})"
+                        )
+                        funding_arbitrage_info["close_timestamp"] = self.current_timestamp
+                        funding_arbitrage_info["trading_pnl"] = trading_pnl
+                        funding_arbitrage_info["funding_pnl"] = funding_pnl
+                        funding_arbitrage_info["total_net_pnl"] = total_net_pnl
+                        funding_arbitrage_info["close_reason"] = reason
+                        self.stopped_funding_arbitrages[token].append(funding_arbitrage_info)
+                        del self.active_funding_arbitrages[token]
+            except Exception as e:
+                self.logger().warning(f"Error evaluating virtual stop condition for {token}: {e}")
             else:
                 # Live Trading Executors Stop Logic
                 executors = self.filter_executors(
