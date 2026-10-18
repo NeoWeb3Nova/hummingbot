@@ -214,6 +214,28 @@ class FundingRateArbitrage(StrategyV2Base):
                 self.executor_orchestrator.execute_action(action)
             self.publish_arbitrage_performance()
 
+            # Periodic scan logging (every 60s)
+            now = self.current_timestamp
+            if not hasattr(self, "_last_scan_log_ts"):
+                self._last_scan_log_ts = 0.0
+            if now - self._last_scan_log_ts >= 60.0:
+                self._last_scan_log_ts = now
+                if not self.active_funding_arbitrages:
+                    thresh_pct = self.config.min_funding_rate_profitability * 100
+                    spread_info = []
+                    for t in self.config.tokens:
+                        try:
+                            f_rep = self.get_funding_info_by_token(t)
+                            best = self.get_most_profitable_combination(f_rep)
+                            if best:
+                                spread_info.append(f"{t}: {best[3] * 100:+.4f}%/d")
+                        except Exception:
+                            pass
+                    self.logger().info(
+                        f"[SCAN] Monitoring funding spreads (Min threshold: {thresh_pct:+.4f}%/day). "
+                        f"Current spreads: [{', '.join(spread_info)}]. Waiting for spread to exceed threshold."
+                    )
+
     def publish_arbitrage_performance(self):
         """
         Aggregate and publish real-time arbitrage performance and trade details via MQTT and local disk.
@@ -349,6 +371,8 @@ class FundingRateArbitrage(StrategyV2Base):
                 },
                 "custom_info": {
                     "is_dry_run": bool(self.config.dry_run),
+                    "min_funding_rate_profitability": float(self.config.min_funding_rate_profitability),
+                    "min_funding_rate_profitability_pct": float(self.config.min_funding_rate_profitability * 100),
                     "active_positions": active_list,
                     "closed_trades": closed_list,
                     "market_comparison": market_list,
