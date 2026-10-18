@@ -170,6 +170,32 @@ class FundingRateArbitrage(StrategyV2Base):
         super().start(clock, timestamp)
         self._last_timestamp = timestamp
         self.apply_initial_setting()
+
+        # Patch Hyperliquid WebSocket funding rate bug if needed
+        try:
+            from hummingbot.connector.derivative.hyperliquid_perpetual.hyperliquid_perpetual_api_order_book_data_source import HyperliquidPerpetualAPIOrderBookDataSource
+            if not getattr(HyperliquidPerpetualAPIOrderBookDataSource, "_funding_rate_patch_applied", False):
+                _orig_parse = HyperliquidPerpetualAPIOrderBookDataSource._parse_funding_info_message
+                async def _patched_parse(ds_self, raw_message, message_queue):
+                    try:
+                        data = raw_message.get("data", {})
+                        ctx = data.get("ctx", data)
+                        if isinstance(ctx, dict) and "funding" in ctx and "openInterest" in ctx:
+                            oi = ctx.pop("openInterest", None)
+                            try:
+                                return await _orig_parse(ds_self, raw_message, message_queue)
+                            finally:
+                                if oi is not None:
+                                    ctx["openInterest"] = oi
+                    except Exception:
+                        pass
+                    return await _orig_parse(ds_self, raw_message, message_queue)
+                HyperliquidPerpetualAPIOrderBookDataSource._parse_funding_info_message = _patched_parse
+                HyperliquidPerpetualAPIOrderBookDataSource._funding_rate_patch_applied = True
+                self.logger().info("[PATCH] Applied Hyperliquid funding rate WebSocket patch.")
+        except Exception as e:
+            self.logger().debug(f"Could not patch Hyperliquid data source: {e}")
+
         try:
             from hummingbot.client.hummingbot_application import HummingbotApplication
             app = HummingbotApplication.main_application()
@@ -340,13 +366,16 @@ class FundingRateArbitrage(StrategyV2Base):
         # 2. Persist local JSON copy to data directory for instant UI read
         try:
             import json
-            data_dir = getattr(self.client_config_map, "data_file_path", None) or "/home/hummingbot/data"
-            if os.path.isdir(data_dir):
+            data_dir = "/home/hummingbot/data"
+            if not os.path.isdir(data_dir):
+                cfg = getattr(self, "client_config_map", None)
+                data_dir = getattr(cfg, "data_file_path", None) if cfg else None
+            if data_dir and os.path.isdir(data_dir):
                 json_path = os.path.join(data_dir, "arbitrage_trades.json")
                 with open(json_path, "w") as f:
-                    json.dump(report["funding_rate_arb"]["custom_info"], f)
-        except Exception:
-            pass
+                    json.dump(report["funding_rate_arb"]["custom_info"], f, indent=2)
+        except Exception as e:
+            self.logger().debug(f"Failed to persist arbitrage_trades.json: {e}")
 
     def apply_initial_setting(self):
         if self.config.dry_run:
