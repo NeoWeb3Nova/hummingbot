@@ -551,25 +551,27 @@ class FundingRateArbitrage(StrategyV2Base):
                     rate = current_info.rate
                     # Long pays if rate > 0, receives if rate < 0 -> payment = - rate * quote_size
                     # Short receives if rate > 0, pays if rate < 0 -> payment = + rate * quote_size
-                    payment_amount = -1 * arb["position_size_quote"] * rate if side == TradeType.BUY else arb["position_size_quote"] * rate
+                    is_buy = (side == TradeType.BUY) if isinstance(side, TradeType) else (str(side) in ["BUY", "TradeType.BUY"])
+                    payment_amount = -1 * arb["position_size_quote"] * rate if is_buy else arb["position_size_quote"] * rate
+                    side_str = side.name if hasattr(side, "name") else str(side)
 
                     arb["funding_payments"].append({
-                        "timestamp": now,
+                        "timestamp": int(now),
                         "connector": conn_name,
-                        "side": side.name,
-                        "rate": rate,
-                        "amount": payment_amount,
+                        "side": side_str,
+                        "rate": float(rate),
+                        "amount": float(payment_amount),
                     })
 
                     interval = self.funding_payment_interval_map.get(conn_name, 60 * 60 * 8)
-                    if current_info.next_funding_utc_timestamp > now:
+                    if getattr(current_info, "next_funding_utc_timestamp", 0) > now:
                         arb[time_key] = current_info.next_funding_utc_timestamp
                     else:
-                        arb[time_key] = next_time + interval
+                        arb[time_key] = now + interval
 
                     self.logger().info(
-                        f"[DRY-RUN] Simulated Funding Payment on {conn_name} for {token} ({side.name}): "
-                        f"Rate={rate:+.6%}, Settlement={payment_amount:+.4f} Quote"
+                        f"[DRY-RUN] Simulated Funding Payment on {conn_name} for {token} ({side_str}): "
+                        f"Rate={float(rate):+.6%}, Settlement={float(payment_amount):+.4f} Quote"
                     )
 
     def create_actions_proposal(self) -> List[CreateExecutorAction]:
@@ -696,8 +698,8 @@ class FundingRateArbitrage(StrategyV2Base):
 
         stop_executor_actions = []
         for token, funding_arbitrage_info in list(self.active_funding_arbitrages.items()):
-            try:
-                if funding_arbitrage_info.get("is_virtual"):
+            if funding_arbitrage_info.get("is_virtual"):
+                try:
                     # Handle Virtual Position Exit Logic
                     trading_pair_1 = self.get_trading_pair_for_connector(token, funding_arbitrage_info["connector_1"])
                     trading_pair_2 = self.get_trading_pair_for_connector(token, funding_arbitrage_info["connector_2"])
@@ -763,31 +765,37 @@ class FundingRateArbitrage(StrategyV2Base):
                         funding_arbitrage_info["close_reason"] = reason
                         self.stopped_funding_arbitrages[token].append(funding_arbitrage_info)
                         del self.active_funding_arbitrages[token]
-            except Exception as e:
-                self.logger().warning(f"Error evaluating virtual stop condition for {token}: {e}")
+                except Exception as e:
+                    self.logger().warning(f"Error evaluating virtual stop condition for {token}: {e}")
             else:
                 # Live Trading Executors Stop Logic
-                executors = self.filter_executors(
-                    executors=self.get_all_executors(),
-                    filter_func=lambda x: x.id in funding_arbitrage_info["executors_ids"]
-                )
-                funding_payments_pnl = sum(funding_payment.amount for funding_payment in funding_arbitrage_info["funding_payments"])
-                executors_pnl = sum(executor.net_pnl_quote for executor in executors)
-                take_profit_condition = executors_pnl + funding_payments_pnl > self.config.profitability_to_take_profit * self.config.position_size_quote
-                funding_info_report = self.get_funding_info_by_token(token)
-                if funding_arbitrage_info["side"] == TradeType.BUY:
-                    funding_rate_diff = self.get_normalized_funding_rate_in_seconds(funding_info_report, funding_arbitrage_info["connector_2"]) - self.get_normalized_funding_rate_in_seconds(funding_info_report, funding_arbitrage_info["connector_1"])
-                else:
-                    funding_rate_diff = self.get_normalized_funding_rate_in_seconds(funding_info_report, funding_arbitrage_info["connector_1"]) - self.get_normalized_funding_rate_in_seconds(funding_info_report, funding_arbitrage_info["connector_2"])
-                current_funding_condition = funding_rate_diff * self.funding_profitability_interval < self.config.funding_rate_diff_stop_loss
-                if take_profit_condition:
-                    self.logger().info("Take profit profitability reached, stopping executors")
-                    self.stopped_funding_arbitrages[token].append(funding_arbitrage_info)
-                    stop_executor_actions.extend([StopExecutorAction(executor_id=executor.id) for executor in executors])
-                elif current_funding_condition:
-                    self.logger().info("Funding rate difference reached for stop loss, stopping executors")
-                    self.stopped_funding_arbitrages[token].append(funding_arbitrage_info)
-                    stop_executor_actions.extend([StopExecutorAction(executor_id=executor.id) for executor in executors])
+                try:
+                    executors = self.filter_executors(
+                        executors=self.get_all_executors(),
+                        filter_func=lambda x: x.id in funding_arbitrage_info["executors_ids"]
+                    )
+                    funding_payments_pnl = sum(
+                        (p.get("amount", 0) if isinstance(p, dict) else getattr(p, "amount", 0))
+                        for p in funding_arbitrage_info.get("funding_payments", [])
+                    )
+                    executors_pnl = sum(executor.net_pnl_quote for executor in executors)
+                    take_profit_condition = executors_pnl + funding_payments_pnl > self.config.profitability_to_take_profit * self.config.position_size_quote
+                    funding_info_report = self.get_funding_info_by_token(token)
+                    if funding_arbitrage_info["side"] == TradeType.BUY:
+                        funding_rate_diff = self.get_normalized_funding_rate_in_seconds(funding_info_report, funding_arbitrage_info["connector_2"]) - self.get_normalized_funding_rate_in_seconds(funding_info_report, funding_arbitrage_info["connector_1"])
+                    else:
+                        funding_rate_diff = self.get_normalized_funding_rate_in_seconds(funding_info_report, funding_arbitrage_info["connector_1"]) - self.get_normalized_funding_rate_in_seconds(funding_info_report, funding_arbitrage_info["connector_2"])
+                    current_funding_condition = funding_rate_diff * self.funding_profitability_interval < self.config.funding_rate_diff_stop_loss
+                    if take_profit_condition:
+                        self.logger().info("Take profit profitability reached, stopping executors")
+                        self.stopped_funding_arbitrages[token].append(funding_arbitrage_info)
+                        stop_executor_actions.extend([StopExecutorAction(executor_id=executor.id) for executor in executors])
+                    elif current_funding_condition:
+                        self.logger().info("Funding rate difference reached for stop loss, stopping executors")
+                        self.stopped_funding_arbitrages[token].append(funding_arbitrage_info)
+                        stop_executor_actions.extend([StopExecutorAction(executor_id=executor.id) for executor in executors])
+                except Exception as e:
+                    self.logger().warning(f"Error evaluating live stop condition for {token}: {e}")
         return stop_executor_actions
 
     def did_complete_funding_payment(self, funding_payment_completed_event: FundingPaymentCompletedEvent):
