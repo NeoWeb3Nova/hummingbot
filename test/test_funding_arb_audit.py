@@ -14,7 +14,7 @@ import unittest
 from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
 from types import SimpleNamespace as NS
-from unittest.mock import patch
+from unittest.mock import patch, AsyncMock, Mock
 
 import pandas as pd
 from pydantic import ValidationError
@@ -205,6 +205,24 @@ class StrategyTests(unittest.TestCase):
         self.assertFalse(self.s.audit.blocked_reason)
         self.assertEqual(messages[0]['funding_rate_arb']['custom_info'],json.loads(self.path.read_text()))
 
+    def test_mqtt_initialization_retries_after_headless_start(self):
+        messages=[]
+        with patch('hummingbot.remote_iface.mqtt.ETopicPublisher',side_effect=[RuntimeError('not ready'),lambda p:messages.append(p)]):
+            self.s.audit.publish()
+            self.assertFalse(self.s.audit.blocked_reason)
+            self.s.current_timestamp+=6
+            self.s.audit.publish()
+        self.assertEqual(len(messages),1)
+        self.assertEqual(self.s.audit.mqtt_status,'published')
+
+    def test_mqtt_disconnect_does_not_masquerade_as_disk_failure(self):
+        self.s.open()
+        self.s._pub=Mock(side_effect=ConnectionError('broker temporarily unavailable'))
+        self.s.audit.publish()
+        self.assertTrue(self.path.exists())
+        self.assertFalse(self.s.audit.blocked_reason)
+        self.assertEqual(self.s.audit.mqtt_status,'unavailable')
+
     def test_forecast_direction_change_resets_persistence(self):
         self.s.audit.create()
         self.assertFalse(self.s.active_funding_arbitrages)
@@ -297,6 +315,24 @@ class StrategyTests(unittest.TestCase):
             'BTC-USDT': NS(last_diff_timestamp=time.perf_counter()-100, last_snapshot_timestamp=0)}))
         with self.assertRaises(MarketUnavailable):
             self.s.audit.books(BN, 'BTC-USDT')
+
+    def test_failed_native_funding_listener_does_not_block_valid_public_book(self):
+        conn = self.s.connectors[BN]
+        conn.ready = False
+        conn.is_trading_required = False
+        conn.status_dict = dict(symbols_mapping_initialized=True,funding_info=False,order_books_initialized=False)
+        self.assertTrue(self.s.audit.books(BN,'BTC-USDT'))
+        conn.status_dict['symbols_mapping_initialized'] = False
+        with self.assertRaises(MarketUnavailable):
+            self.s.audit.books(BN,'BTC-USDT')
+
+    def test_clock_tick_runs_audit_while_global_connector_readiness_is_false(self):
+        strategy = NS(_is_stop_triggered=False,on_tick=Mock())
+        FundingRateArbitrage.tick(strategy,NOW)
+        strategy.on_tick.assert_called_once()
+        strategy._is_stop_triggered = True
+        FundingRateArbitrage.tick(strategy,NOW+1)
+        strategy.on_tick.assert_called_once()
 
     def test_corrupt_state_preserved_and_entries_blocked(self):
         self.path.write_text('{broken')
@@ -437,6 +473,14 @@ class FundingTests(unittest.IsolatedAsyncioTestCase):
                         self.assertIsNone(conn.binance_perpetual_api_key)
         finally:
             ConnectorManager.create_connector = original
+
+    async def test_public_trading_rule_refresh_retries_without_private_tasks(self):
+        conn = self.s.connectors[BN]
+        conn._update_trading_rules = AsyncMock(side_effect=[OSError('transient'),None])
+        await self.s.audit._refresh_public_rules(BN,conn)
+        await self.s.audit._refresh_public_rules(BN,conn)
+        self.assertEqual(conn._update_trading_rules.await_count,2)
+        self.assertNotIn(BN,self.s.audit.rules_jobs)
 
 
 class PublicDataTests(unittest.TestCase):

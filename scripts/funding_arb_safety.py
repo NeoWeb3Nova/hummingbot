@@ -48,6 +48,10 @@ class FundingArbSafety:
         self.audit_started_at = None
         self.last_persist = 0.0
         self.restore_failed = False
+        self.rules_refresh = {}
+        self.rules_jobs = set()
+        self.mqtt_status = "waiting"
+        self.mqtt_retry_at = 0.0
 
     @property
     def path(self):
@@ -145,6 +149,13 @@ class FundingArbSafety:
 
     def refresh(self):
         now = self.s.current_timestamp
+        for name, connector in self.s.connectors.items():
+            updater = getattr(connector, "_update_trading_rules", None)
+            if updater is not None and name not in self.rules_jobs and now - self.rules_refresh.get(name, 0) >= 30:
+                if not getattr(connector, "is_trading_required", False):
+                    self.rules_refresh[name] = now
+                    self.rules_jobs.add(name)
+                    self._spawn(self._refresh_public_rules(name, connector))
         if (self.metadata_task is None or self.metadata_task.done()) and now - self.metadata_refresh >= 30:
             self.metadata_refresh = now
             self.metadata_task = self._spawn(self._refresh_metadata())
@@ -156,6 +167,20 @@ class FundingArbSafety:
                     if key not in self.funding_jobs:
                         self.funding_jobs.add(key)
                         self._spawn(self._sync_funding(target, i, key))
+
+    async def _refresh_public_rules(self, name, connector):
+        try:
+            # Hummingbot does not run this public loop when trading_required
+            # is false. Reuse its venue-specific parser without enabling any
+            # account, user-stream, leverage or order polling tasks.
+            async with self.semaphore:
+                await connector._update_trading_rules()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.s.logger().warning("[PUBLIC-RULES] %s: %s; entries still require a valid symbol rule.", name, exc)
+        finally:
+            self.rules_jobs.discard(name)
 
     async def _refresh_metadata(self):
         try:
@@ -280,7 +305,9 @@ class FundingArbSafety:
     def books(self, connector, pair):
         conn = self.s.connectors[connector]
         if not conn.ready:
-            raise MarketUnavailable("connector not ready")
+            public = getattr(conn, "status_dict", {})
+            if getattr(conn, "is_trading_required", True) or public.get("symbols_mapping_initialized") is not True:
+                raise MarketUnavailable("connector public symbol mapping not ready")
         status = getattr(conn, "network_status", None)
         if status is not None and getattr(status, "name", "CONNECTED") != "CONNECTED":
             raise MarketUnavailable("connector disconnected")
@@ -787,6 +814,7 @@ class FundingArbSafety:
                 "graduation_status": {"asset_graduation_enabled": self.s.config.asset_graduation_enabled},
                 "performance": performance, "paper_account": state,
                 "audit": {"started_at": self.audit_started_at, "blocked_reason": self.blocked_reason,
+                          "mqtt_delivery": self.mqtt_status,
                           "rejections": dict(self.rejections), "last_rejection": copy.deepcopy(self.last_rejection),
                           "valid_valuation": all(p["valuation_status"] == "valid" for p in active),
                           "funding_note": "Confirmed historical rates; non-historical reference prices are explicitly estimated. No real payments.",
@@ -803,13 +831,34 @@ class FundingArbSafety:
     def publish(self):
         try:
             self.persist()
-            data = self.last_report
-            if data and getattr(self.s, "_pub", None):
-                payload = {"funding_rate_arb": {"controller_name": "funding_rate_arb", "performance": data["performance"], "custom_info": data}}
-                self.s._pub(json.loads(json.dumps(payload, default=json_value, allow_nan=False)))
         except Exception as exc:
             self.blocked_reason = f"state persistence failed: {exc}"
             self.s.logger().error("[PERSIST-BLOCKED] %s", exc)
+            return
+        data = self.last_report
+        if not data:
+            return
+        if not getattr(self.s, "_pub", None):
+            if self.s.current_timestamp < self.mqtt_retry_at:
+                return
+            self.mqtt_retry_at = self.s.current_timestamp + 5
+            try:
+                # Headless quickstart may initialize MQTT after strategy.start.
+                from hummingbot.remote_iface.mqtt import ETopicPublisher
+                self.s._pub = ETopicPublisher("performance", use_bot_prefix=True)
+                self.s.mqtt_enabled = True
+            except Exception:
+                self.mqtt_status = "waiting"
+                return
+        try:
+            payload = {"funding_rate_arb": {"controller_name": "funding_rate_arb", "performance": data["performance"], "custom_info": data}}
+            self.s._pub(json.loads(json.dumps(payload, default=json_value, allow_nan=False)))
+            self.mqtt_status = "published"
+        except Exception as exc:
+            self.mqtt_status = "unavailable"
+            self.s._pub = None
+            self.mqtt_retry_at = self.s.current_timestamp + 5
+            self.s.logger().warning("[MQTT-PENDING] %s; local ledger remains authoritative.", exc)
 
     def tick(self):
         self.refresh()

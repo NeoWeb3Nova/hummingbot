@@ -655,6 +655,13 @@ class FundingRateArbitrage(StrategyV2Base):
     def on_tick(self):
         self.audit.tick()
 
+    def tick(self, timestamp: float):
+        # The native V2 gate includes every symbol's optional funding listener.
+        # Paper uses its own public funding history and checks each book/rule;
+        # an unrelated failed listener must not suppress risk or reporting.
+        if not getattr(self, "_is_stop_triggered", False):
+            self.on_tick()
+
     async def on_stop(self):
         self._is_stop_triggered = True
         await self.audit.shutdown()
