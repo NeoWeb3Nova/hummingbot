@@ -52,6 +52,8 @@ class FundingArbSafety:
         self.rules_jobs = set()
         self.mqtt_status = "waiting"
         self.mqtt_retry_at = 0.0
+        self.market_health_at = 0.0
+        self.market_health = {}
 
     @property
     def path(self):
@@ -796,6 +798,23 @@ class FundingArbSafety:
                        "global_pnl_quote": float(realized + floating), "volume_traded": float(volume),
                        "close_type_counts": dict(Counter(r.get("close_reason", "Unknown") for r in closed))}
         state = self.budget()
+        if now - self.market_health_at >= 10:
+            self.market_health_at = now
+            self.market_health = {}
+            for name, conn in self.s.connectors.items():
+                good_books, good_rules, errors = [], [], {}
+                for token in sorted(self.s.config.tokens):
+                    pair = self.s.get_trading_pair_for_connector(token, name)
+                    if pair in conn.trading_rules:
+                        good_rules.append(token)
+                    try:
+                        self.books(name, pair)
+                        good_books.append(token)
+                    except (MarketUnavailable, KeyError, ValueError) as exc:
+                        errors[token] = str(exc)
+                self.market_health[name] = {"public_only": not getattr(conn, "is_trading_required", False),
+                    "configured_pairs": len(self.s.config.tokens), "books_ready": good_books,
+                    "rules_ready": good_rules, "book_errors": errors}
         return {"schema_version": SCHEMA_VERSION, "model_version": MODEL_VERSION, "is_dry_run": True,
                 "leverage": self.s.config.leverage, "updated_at": now,
                 "watchlist": sorted(self.s.config.tokens),
@@ -815,6 +834,7 @@ class FundingArbSafety:
                 "performance": performance, "paper_account": state,
                 "audit": {"started_at": self.audit_started_at, "blocked_reason": self.blocked_reason,
                           "mqtt_delivery": self.mqtt_status,
+                          "public_connectors": copy.deepcopy(self.market_health),
                           "rejections": dict(self.rejections), "last_rejection": copy.deepcopy(self.last_rejection),
                           "valid_valuation": all(p["valuation_status"] == "valid" for p in active),
                           "funding_note": "Confirmed historical rates; non-historical reference prices are explicitly estimated. No real payments.",
