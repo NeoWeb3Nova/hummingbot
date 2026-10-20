@@ -6,7 +6,7 @@ import time
 import urllib.request
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import pandas as pd
 from pydantic import Field, field_validator
@@ -336,7 +336,7 @@ class BasisStatArbitrage(StrategyV2Base):
             pass
 
     def _load_persisted_state(self):
-        """Load closed trades history from basis_stat_arb_trades.json if available."""
+        """Load closed trades history and active positions from basis_stat_arb_trades.json if available."""
         for path in self.data_file_candidates:
             if os.path.exists(path):
                 try:
@@ -348,7 +348,16 @@ class BasisStatArbitrage(StrategyV2Base):
                         if tok not in self.stopped_basis_arbitrages:
                             self.stopped_basis_arbitrages[tok] = []
                         self.stopped_basis_arbitrages[tok].append(item)
-                    self.logger().info(f"[BASIS-STAT-ARB] Loaded {len(closed_list)} previous trades from {path}")
+                    active_list = data.get("active_positions", [])
+                    for pos in active_list:
+                        tok = pos.get("token")
+                        if tok and tok not in self.active_basis_arbitrages:
+                            pos.setdefault("settled_funding_pnl", 0.0)
+                            pos.setdefault("funding_payments", [])
+                            pos.setdefault("next_funding_time_1", int(self.current_timestamp + 28800))
+                            pos.setdefault("next_funding_time_2", int(self.current_timestamp + 3600))
+                            self.active_basis_arbitrages[tok] = pos
+                    self.logger().info(f"[BASIS-STAT-ARB] Loaded {len(closed_list)} closed trades & {len(self.active_basis_arbitrages)} active positions from {path}")
                     break
                 except Exception as e:
                     self.logger().warning(f"Could not load state from {path}: {e}")
@@ -356,6 +365,7 @@ class BasisStatArbitrage(StrategyV2Base):
     def on_tick(self):
         if self.ready_to_trade and self.market_data_provider.ready:
             self.check_strategy_commands()
+            self.check_funding_settlement()
             actions = self.determine_executor_actions()
             for action in actions:
                 self.executor_orchestrator.execute_action(action)
@@ -397,10 +407,107 @@ class BasisStatArbitrage(StrategyV2Base):
             except Exception as e:
                 self.logger().error(f"Error handling basis command: {e}")
 
-    def get_safe_quote_price(self, connector_name: str, trading_pair: str, quote_volume: Decimal, is_buy: bool, fallback_price: Decimal = None) -> Decimal:
+    def check_funding_settlement(self):
         """
-        Safely retrieve price for quote volume. If orderbook depth is insufficient or returns NaN,
-        fall back to MidPrice, LastTradePrice, or fallback_price. Never returns NaN.
+        Account for discrete real funding payments across active positions.
+        Only when current_timestamp crosses the actual exchange funding settlement window
+        is a funding settlement recorded and added to settled_funding_pnl.
+        """
+        now = self.current_timestamp
+        for token, pos in list(self.active_basis_arbitrages.items()):
+            if not pos.get("is_virtual", True):
+                # In live mode, events are captured by did_complete_funding_payment hook
+                continue
+
+            funding_info = self.get_funding_info_by_token(token)
+            legs = [
+                ("connector_1", "next_funding_time_1", pos["side_1"]),
+                ("connector_2", "next_funding_time_2", pos["side_2"]),
+            ]
+            pos_size = Decimal(str(pos["position_size"]))
+
+            for conn_key, time_key, side_str in legs:
+                conn_name = pos[conn_key]
+                next_time = pos.get(time_key, 0)
+
+                if now >= next_time and next_time > 0:
+                    f_info = funding_info.get(conn_name)
+                    if f_info is not None:
+                        raw_rate = Decimal(str(f_info.rate))
+                        if abs(raw_rate) > Decimal("0.5"):
+                            raw_rate = Decimal("0.0001")
+                    else:
+                        raw_rate = Decimal("0")
+
+                    # Settlement cashflow calculation:
+                    # Long (BUY): pays if rate > 0, receives if rate < 0 -> payment = -1 * pos_size * rate
+                    # Short (SELL): receives if rate > 0, pays if rate < 0 -> payment = +1 * pos_size * rate
+                    if side_str == "BUY":
+                        payment = -1 * pos_size * raw_rate
+                    else:
+                        payment = pos_size * raw_rate
+
+                    payment_float = float(payment)
+                    pos.setdefault("funding_payments", []).append({
+                        "timestamp": int(now),
+                        "connector": conn_name,
+                        "side": side_str,
+                        "rate": float(raw_rate),
+                        "amount": payment_float,
+                    })
+                    pos["settled_funding_pnl"] = float(pos.get("settled_funding_pnl", 0.0) + payment_float)
+
+                    interval = self.funding_payment_interval_map.get(conn_name, 3600 if "hyperliquid" in conn_name else 28800)
+                    next_utc = getattr(f_info, "next_funding_utc_timestamp", 0) if f_info else 0
+                    if next_utc > now:
+                        pos[time_key] = int(next_utc)
+                    else:
+                        pos[time_key] = int(now + interval)
+
+                    self.logger().info(
+                        f"💰 [BASIS-FUNDING-SETTLED] Token '{token}' on {conn_name} ({side_str}): "
+                        f"Rate {float(raw_rate):+.4%}, Cashflow ${payment_float:+.4f}. "
+                        f"Cumulative Settled: ${pos['settled_funding_pnl']:+.4f} ({len(pos['funding_payments'])} settlements)"
+                    )
+
+    def did_complete_funding_payment(self, funding_payment_completed_event: FundingPaymentCompletedEvent):
+        """
+        Listen to real exchange funding payments in live trading mode and record actual settlements.
+        """
+        try:
+            raw_token = funding_payment_completed_event.trading_pair.split("-")[0]
+            for token, pos in self.active_basis_arbitrages.items():
+                if token in raw_token or raw_token in token:
+                    amount = float(funding_payment_completed_event.amount)
+                    pos.setdefault("funding_payments", []).append({
+                        "timestamp": int(self.current_timestamp),
+                        "connector": funding_payment_completed_event.connector_name,
+                        "trading_pair": funding_payment_completed_event.trading_pair,
+                        "rate": float(funding_payment_completed_event.funding_rate),
+                        "amount": amount,
+                    })
+                    pos["settled_funding_pnl"] = pos.get("settled_funding_pnl", 0.0) + amount
+                    self.logger().info(
+                        f"💰 [LIVE-FUNDING-SETTLED] Token '{token}' received real funding on {funding_payment_completed_event.connector_name}: "
+                        f"${amount:+.4f}. Cumulative Settled: ${pos['settled_funding_pnl']:+.4f}"
+                    )
+                    break
+        except Exception as e:
+            self.logger().error(f"Error handling live funding payment: {e}")
+
+    def get_executable_quote_price(
+        self,
+        connector_name: str,
+        trading_pair: str,
+        quote_volume: Decimal,
+        is_buy: bool
+    ) -> Optional[Decimal]:
+        """
+        Strictly retrieve executable price from orderbook for quote volume.
+        When is_buy is True, walks the Ask side (cost to buy).
+        When is_buy is False, walks the Bid side (proceeds from selling).
+        Returns None if orderbook depth is insufficient, price is NaN, <= 0, or an error occurs.
+        CRITICAL: Never fall back to MidPrice, LastTradePrice, or dummy constant 1.0!
         """
         try:
             res = self.market_data_provider.get_price_for_quote_volume(
@@ -414,8 +521,17 @@ class BasisStatArbitrage(StrategyV2Base):
                 return Decimal(str(p))
         except Exception:
             pass
+        return None
 
-        # Try MidPrice
+    def get_indicative_price(
+        self,
+        connector_name: str,
+        trading_pair: str
+    ) -> Optional[Decimal]:
+        """
+        Retrieve indicative reference price (MidPrice -> LastTradePrice) for valuation and display only.
+        Returns None if unavailable. NEVER returns dummy constants like 1.0.
+        """
         try:
             mid = self.market_data_provider.get_price_by_type(connector_name, trading_pair, PriceType.MidPrice)
             if mid is not None and not math.isnan(float(mid)) and float(mid) > 0:
@@ -423,7 +539,6 @@ class BasisStatArbitrage(StrategyV2Base):
         except Exception:
             pass
 
-        # Try LastTradePrice
         try:
             last = self.market_data_provider.get_price_by_type(connector_name, trading_pair, PriceType.LastTradePrice)
             if last is not None and not math.isnan(float(last)) and float(last) > 0:
@@ -431,10 +546,7 @@ class BasisStatArbitrage(StrategyV2Base):
         except Exception:
             pass
 
-        if fallback_price is not None and not fallback_price.is_nan() and fallback_price > 0:
-            return fallback_price
-
-        return Decimal("1")
+        return None
 
     def get_funding_info_by_token(self, token: str) -> Dict:
         funding_rates = {}
@@ -483,46 +595,62 @@ class BasisStatArbitrage(StrategyV2Base):
             tp2 = self.get_trading_pair_for_connector(token, c2)
 
             pos_size = self.config.position_size_quote
-            p1 = self.get_safe_quote_price(c1, tp1, pos_size, True)
-            p2 = self.get_safe_quote_price(c2, tp2, pos_size, True)
-
-            if p1 <= 0 or p2 <= 0:
-                continue
-
-            # Normalized prices
             m1 = Decimal(str(self.get_token_multiplier(token, c1)))
             m2 = Decimal(str(self.get_token_multiplier(token, c2)))
-            p1_norm = p1 / m1
-            p2_norm = p2 / m2
 
-            # Basis calculation: (P1 - P2) / P2
-            basis_spread = (p1_norm - p2_norm) / p2_norm
-            abs_basis = abs(basis_spread)
+            # Query real executable orderbook Bid and Ask for pos_size on BOTH exchanges
+            # Sell leg hits Bid (is_buy=False); Buy leg hits Ask (is_buy=True)
+            p1_bid = self.get_executable_quote_price(c1, tp1, pos_size, is_buy=False)
+            p1_ask = self.get_executable_quote_price(c1, tp1, pos_size, is_buy=True)
+            p2_bid = self.get_executable_quote_price(c2, tp2, pos_size, is_buy=False)
+            p2_ask = self.get_executable_quote_price(c2, tp2, pos_size, is_buy=True)
 
-            # Check dislocation threshold
-            if abs_basis < self.config.min_entry_basis_pct:
+            # Strict Guard: If any order book quote cannot be obtained, skip token completely
+            # Zero tolerance for dummy fallback prices like MidPrice, LastTradePrice, or 1.0!
+            if p1_bid is None or p1_ask is None or p2_bid is None or p2_ask is None:
                 self.entry_candidate_ticks[token] = 0
                 continue
 
-            # Determine trading sides:
-            # If basis_spread > 0 (P1 > P2): C1 is overvalued -> Short C1, Long C2
-            # If basis_spread < 0 (P1 < P2): C1 is undervalued -> Long C1, Short C2
-            if basis_spread > 0:
+            # Normalized executable prices
+            p1_bid_norm = p1_bid / m1
+            p1_ask_norm = p1_ask / m1
+            p2_bid_norm = p2_bid / m2
+            p2_ask_norm = p2_ask / m2
+
+            # Direction A: Sell C1 @ Bid1, Buy C2 @ Ask2 (Overvalued C1, Undervalued C2)
+            spread_A = (p1_bid_norm - p2_ask_norm) / p2_ask_norm
+
+            # Direction B: Buy C1 @ Ask1, Sell C2 @ Bid2 (Undervalued C1, Overvalued C2)
+            spread_B = (p2_bid_norm - p1_ask_norm) / p1_ask_norm
+
+            min_entry = self.config.min_entry_basis_pct
+
+            # Determine best executable direction
+            if spread_A >= min_entry and spread_A >= spread_B:
                 c1_side = TradeType.SELL
                 c2_side = TradeType.BUY
-            else:
+                c1_exec_price = p1_bid
+                c2_exec_price = p2_ask
+                c1_norm = p1_bid_norm
+                c2_norm = p2_ask_norm
+                executable_basis_spread = spread_A
+            elif spread_B >= min_entry and spread_B > spread_A:
                 c1_side = TradeType.BUY
                 c2_side = TradeType.SELL
+                c1_exec_price = p1_ask
+                c2_exec_price = p2_bid
+                c1_norm = p1_ask_norm
+                c2_norm = p2_bid_norm
+                executable_basis_spread = spread_B
+            else:
+                self.entry_candidate_ticks[token] = 0
+                continue
 
-            # Double-Dip Funding Synergy Check
+            # Double-Dip Funding Synergy Check for selected direction
             funding_info = self.get_funding_info_by_token(token)
             rate1_sec = self.get_normalized_funding_rate_in_seconds(funding_info, c1)
             rate2_sec = self.get_normalized_funding_rate_in_seconds(funding_info, c2)
 
-            # Calculate daily carry expected for this side:
-            # When Short C1 / Long C2:
-            # C1 shorts receive positive funding if rate1 > 0; pay if rate1 < 0 -> +rate1
-            # C2 longs receive positive funding if rate2 < 0; pay if rate2 > 0 -> -rate2
             if c1_side == TradeType.SELL:
                 daily_carry = (rate1_sec - rate2_sec) * 86400
             else:
@@ -534,7 +662,8 @@ class BasisStatArbitrage(StrategyV2Base):
 
             if daily_carry < -self.config.max_adverse_daily_funding_pct:
                 self.logger().debug(
-                    f"[BASIS-SKIP] Token {token} basis {float(basis_spread):+.2%} dislocated, but adverse funding {float(daily_carry):+.2%}/d exceeds limit."
+                    f"[BASIS-SKIP] Token {token} executable basis {float(executable_basis_spread):+.2%}, "
+                    f"but adverse funding {float(daily_carry):+.2%}/d exceeds limit."
                 )
                 self.entry_candidate_ticks[token] = 0
                 continue
@@ -544,50 +673,67 @@ class BasisStatArbitrage(StrategyV2Base):
             self.entry_candidate_ticks[token] = self.entry_candidate_ticks.get(token, 0) + 1
             if self.entry_candidate_ticks[token] < req_ticks:
                 self.logger().info(
-                    f"⚡ [BASIS-PULSE] Token '{token}' basis dislocation {float(basis_spread):+.2%} detected ({self.entry_candidate_ticks[token]}/{req_ticks} ticks). "
-                    f"Direction: {c1_side.name} {c1} / {c2_side.name} {c2}. Carry: {float(daily_carry):+.2%}/d."
+                    f"⚡ [BASIS-PULSE] Token '{token}' true executable basis {float(executable_basis_spread):+.2%} "
+                    f"({self.entry_candidate_ticks[token]}/{req_ticks} ticks). "
+                    f"Direction: {c1_side.name} {c1} @ ${float(c1_exec_price):.4f} / {c2_side.name} {c2} @ ${float(c2_exec_price):.4f}. "
+                    f"Indicative Carry: {float(daily_carry):+.2%}/d."
                 )
                 continue
 
             # Confirmed Opportunity! Reset counter and enter
             self.entry_candidate_ticks[token] = 0
             self.logger().info(
-                f"🚀 [BASIS-ENTRY-TRIGGER] Token '{token}' confirmed dislocation: {float(basis_spread):+.3%}! "
-                f"Entering: {c1_side.name} {c1} @ ${float(p1):.4f} | {c2_side.name} {c2} @ ${float(p2):.4f} | Carry={float(daily_carry):+.2%}/d"
+                f"🚀 [BASIS-ENTRY-TRIGGER] Token '{token}' confirmed executable dislocation: {float(executable_basis_spread):+.3%}! "
+                f"Entering: {c1_side.name} {c1} @ ${float(c1_exec_price):.4f} | {c2_side.name} {c2} @ ${float(c2_exec_price):.4f} | "
+                f"Indicative Carry={float(daily_carry):+.2%}/d"
             )
 
+            # Determine next discrete settlement times
+            funding_info_1 = funding_info.get(c1)
+            funding_info_2 = funding_info.get(c2)
+            next_f1 = getattr(funding_info_1, "next_funding_utc_timestamp", 0) if funding_info_1 else 0
+            next_f2 = getattr(funding_info_2, "next_funding_utc_timestamp", 0) if funding_info_2 else 0
+            if next_f1 == 0 or next_f1 <= self.current_timestamp:
+                next_f1 = int(self.current_timestamp + self.funding_payment_interval_map.get(c1, 28800))
+            if next_f2 == 0 or next_f2 <= self.current_timestamp:
+                next_f2 = int(self.current_timestamp + self.funding_payment_interval_map.get(c2, 3600 if "hyperliquid" in c2 else 28800))
+
+            pos_data = {
+                "token": token,
+                "is_virtual": self.config.dry_run,
+                "connector_1": c1,
+                "connector_2": c2,
+                "side_1": c1_side.name,
+                "side_2": c2_side.name,
+                "entry_price_1": float(c1_exec_price),
+                "entry_price_2": float(c2_exec_price),
+                "entry_norm_price_1": float(c1_norm),
+                "entry_norm_price_2": float(c2_norm),
+                "entry_basis_pct": float(executable_basis_spread),
+                "target_compression_pct": float(self.config.take_profit_basis_compression_pct),
+                "position_size": float(pos_size),
+                "leverage": self.config.leverage,
+                "open_timestamp": self.current_timestamp,
+                "expected_daily_carry": float(daily_carry),
+                "trailing_active": False,
+                "peak_pnl_pct": 0.0,
+                # Discrete Funding Settlement Ledger
+                "settled_funding_pnl": 0.0,
+                "funding_payments": [],
+                "next_funding_time_1": int(next_f1),
+                "next_funding_time_2": int(next_f2),
+            }
+
             if self.config.dry_run:
-                # Open Paper/Dry-Run Position
-                self.active_basis_arbitrages[token] = {
-                    "token": token,
-                    "is_virtual": True,
-                    "connector_1": c1,
-                    "connector_2": c2,
-                    "side_1": c1_side.name,
-                    "side_2": c2_side.name,
-                    "entry_price_1": float(p1),
-                    "entry_price_2": float(p2),
-                    "entry_norm_price_1": float(p1_norm),
-                    "entry_norm_price_2": float(p2_norm),
-                    "entry_basis_pct": float(basis_spread),
-                    "target_compression_pct": float(self.config.take_profit_basis_compression_pct),
-                    "position_size": float(pos_size),
-                    "leverage": self.config.leverage,
-                    "open_timestamp": self.current_timestamp,
-                    "expected_daily_carry": float(daily_carry),
-                    "trailing_active": False,
-                    "peak_pnl_pct": 0.0,
-                    "funding_payments": [],
-                }
+                self.active_basis_arbitrages[token] = pos_data
             else:
-                # Live Trading Position Executors
                 pos_cfg_1 = PositionExecutorConfig(
                     timestamp=self.current_timestamp,
                     connector_name=c1,
                     trading_pair=tp1,
                     side=c1_side,
-                    entry_price=p1,
-                    amount=pos_size / p1,
+                    entry_price=c1_exec_price,
+                    amount=pos_size / c1_exec_price,
                     leverage=self.config.leverage,
                     triple_barrier_config=TripleBarrierConfig(open_order_type=OrderType.MARKET),
                 )
@@ -596,33 +742,14 @@ class BasisStatArbitrage(StrategyV2Base):
                     connector_name=c2,
                     trading_pair=tp2,
                     side=c2_side,
-                    entry_price=p2,
-                    amount=pos_size / p2,
+                    entry_price=c2_exec_price,
+                    amount=pos_size / c2_exec_price,
                     leverage=self.config.leverage,
                     triple_barrier_config=TripleBarrierConfig(open_order_type=OrderType.MARKET),
                 )
-                self.active_basis_arbitrages[token] = {
-                    "token": token,
-                    "is_virtual": False,
-                    "connector_1": c1,
-                    "connector_2": c2,
-                    "executors_ids": [pos_cfg_1.id, pos_cfg_2.id],
-                    "side_1": c1_side.name,
-                    "side_2": c2_side.name,
-                    "entry_price_1": float(p1),
-                    "entry_price_2": float(p2),
-                    "entry_norm_price_1": float(p1_norm),
-                    "entry_norm_price_2": float(p2_norm),
-                    "entry_basis_pct": float(basis_spread),
-                    "target_compression_pct": float(self.config.take_profit_basis_compression_pct),
-                    "position_size": float(pos_size),
-                    "leverage": self.config.leverage,
-                    "open_timestamp": self.current_timestamp,
-                    "expected_daily_carry": float(daily_carry),
-                    "trailing_active": False,
-                    "peak_pnl_pct": 0.0,
-                    "funding_payments": [],
-                }
+                pos_data["is_virtual"] = False
+                pos_data["executors_ids"] = [pos_cfg_1.id, pos_cfg_2.id]
+                self.active_basis_arbitrages[token] = pos_data
                 create_actions.extend([CreateExecutorAction(executor_config=pos_cfg_1), CreateExecutorAction(executor_config=pos_cfg_2)])
 
         return create_actions
@@ -649,10 +776,17 @@ class BasisStatArbitrage(StrategyV2Base):
             p1_entry = Decimal(str(pos["entry_price_1"]))
             p2_entry = Decimal(str(pos["entry_price_2"]))
 
-            p1_curr = self.get_safe_quote_price(c1, tp1, pos_size, pos["side_1"] != "BUY")
-            p2_curr = self.get_safe_quote_price(c2, tp2, pos_size, pos["side_2"] != "BUY")
+            # To CLOSE leg 1:
+            # If opened BUY -> must SELL (is_buy=False, hitting Bid)
+            # If opened SELL -> must BUY (is_buy=True, hitting Ask)
+            is_buy_close_1 = (pos["side_1"] != "BUY")
+            is_buy_close_2 = (pos["side_2"] != "BUY")
 
-            if p1_curr <= 0 or p2_curr <= 0:
+            p1_curr = self.get_executable_quote_price(c1, tp1, pos_size, is_buy=is_buy_close_1)
+            p2_curr = self.get_executable_quote_price(c2, tp2, pos_size, is_buy=is_buy_close_2)
+
+            # Strict guard: If either executable quote is unavailable, do NOT evaluate exit at corrupted dummy prices!
+            if p1_curr is None or p2_curr is None:
                 continue
 
             m1 = Decimal(str(self.get_token_multiplier(token, c1)))
@@ -677,19 +811,23 @@ class BasisStatArbitrage(StrategyV2Base):
             else:
                 leg2_pnl = (p2_entry - p2_curr) * (pos_size / p2_entry)
 
-            # Trading fees estimate (0.04% per leg maker/taker)
+            # Trading fees estimate (0.05% per leg maker/taker, roundtrip = 4 legs)
             fee_rate = Decimal("0.0005")
             est_roundtrip_fees = pos_size * fee_rate * Decimal("4")
             gross_trading_pnl = leg1_pnl + leg2_pnl
             net_trading_pnl = gross_trading_pnl - est_roundtrip_fees
 
-            # Accumulated virtual/real funding
+            # Discrete settled funding cashflow (strictly settled at actual exchange settlement windows)
+            settled_funding = Decimal(str(pos.get("settled_funding_pnl", 0.0)))
+
+            # Theoretical indicative accrued carry (for reference only, NEVER counted as realized cashflow)
             duration_s = self.current_timestamp - pos["open_timestamp"]
             duration_h = duration_s / 3600.0
             daily_carry = Decimal(str(pos.get("expected_daily_carry", 0.0)))
-            funding_income = pos_size * daily_carry * Decimal(str(duration_s / 86400.0))
+            indicative_carry = pos_size * daily_carry * Decimal(str(duration_s / 86400.0))
 
-            total_net_pnl = net_trading_pnl + funding_income
+            # Total Net PnL = Net Trading PnL + Actual Settled Funding!
+            total_net_pnl = net_trading_pnl + settled_funding
             net_pnl_pct = total_net_pnl / pos_size if pos_size > 0 else Decimal("0")
 
             # Update peak PnL for trailing
@@ -757,7 +895,9 @@ class BasisStatArbitrage(StrategyV2Base):
                     "token": token,
                     "reason": reason,
                     "net_trading_pnl": float(net_trading_pnl),
-                    "funding_income": float(funding_income),
+                    "settled_funding_pnl": float(settled_funding),
+                    "indicative_accrued_carry": float(indicative_carry),
+                    "funding_income": float(settled_funding),
                     "total_net_pnl": float(total_net_pnl),
                     "net_pnl_pct": float(net_pnl_pct),
                     "close_p1": float(p1_curr),
@@ -786,7 +926,10 @@ class BasisStatArbitrage(StrategyV2Base):
                 "position_size": pos["position_size"],
                 "leverage": pos["leverage"],
                 "trading_pnl": item["net_trading_pnl"],
-                "funding_pnl": item["funding_income"],
+                "funding_pnl": item["settled_funding_pnl"],
+                "indicative_accrued_carry": item["indicative_accrued_carry"],
+                "settlement_count": len(pos.get("funding_payments", [])),
+                "funding_payments": pos.get("funding_payments", []),
                 "total_net_pnl": item["total_net_pnl"],
                 "net_pnl_pct": item["net_pnl_pct"],
                 "close_reason": item["reason"],
@@ -801,7 +944,7 @@ class BasisStatArbitrage(StrategyV2Base):
 
             self.logger().info(
                 f"🎯 [BASIS-POSITION-CLOSED] Token '{token}' ({item['reason']})!\n"
-                f"  Trading PnL: ${item['net_trading_pnl']:+.2f}, Carry Bonus: ${item['funding_income']:+.2f}, "
+                f"  Trading PnL: ${item['net_trading_pnl']:+.2f}, Settled Funding: ${item['settled_funding_pnl']:+.2f} ({len(pos.get('funding_payments', []))} settlements), "
                 f"Total Net: ${item['total_net_pnl']:+.2f} ({item['net_pnl_pct']:+.2%}), Held: {item['duration_seconds'] // 60}m"
             )
 
@@ -818,6 +961,7 @@ class BasisStatArbitrage(StrategyV2Base):
     def _force_close_virtual_position(self, token: str, reason: str):
         if token in self.active_basis_arbitrages:
             pos = self.active_basis_arbitrages.pop(token)
+            settled = float(pos.get("settled_funding_pnl", 0.0))
             record = {
                 "token": token,
                 "connector_1": pos["connector_1"],
@@ -833,9 +977,12 @@ class BasisStatArbitrage(StrategyV2Base):
                 "position_size": pos["position_size"],
                 "leverage": pos["leverage"],
                 "trading_pnl": 0.0,
-                "funding_pnl": 0.0,
-                "total_net_pnl": 0.0,
-                "net_pnl_pct": 0.0,
+                "funding_pnl": settled,
+                "indicative_accrued_carry": 0.0,
+                "settlement_count": len(pos.get("funding_payments", [])),
+                "funding_payments": pos.get("funding_payments", []),
+                "total_net_pnl": settled,
+                "net_pnl_pct": settled / pos["position_size"] if pos.get("position_size") else 0.0,
                 "close_reason": reason,
                 "open_timestamp": pos["open_timestamp"],
                 "close_timestamp": self.current_timestamp,
@@ -882,8 +1029,18 @@ class BasisStatArbitrage(StrategyV2Base):
             duration_s = int(self.current_timestamp - pos["open_timestamp"])
             c1 = pos["connector_1"]
             c2 = pos["connector_2"]
-            p1_curr = float(self.get_safe_quote_price(c1, self.get_trading_pair_for_connector(t, c1), Decimal(str(pos["position_size"])), True))
-            p2_curr = float(self.get_safe_quote_price(c2, self.get_trading_pair_for_connector(t, c2), Decimal(str(pos["position_size"])), True))
+            tp1 = self.get_trading_pair_for_connector(t, c1)
+            tp2 = self.get_trading_pair_for_connector(t, c2)
+            pos_size = float(pos["position_size"])
+
+            # To evaluate current floating exit price, query executable exit side
+            # If opened BUY -> exit is SELL (is_buy=False, hitting Bid)
+            # If opened SELL -> exit is BUY (is_buy=True, hitting Ask)
+            p1_exec = self.get_executable_quote_price(c1, tp1, Decimal(str(pos_size)), is_buy=(pos["side_1"] != "BUY"))
+            p2_exec = self.get_executable_quote_price(c2, tp2, Decimal(str(pos_size)), is_buy=(pos["side_2"] != "BUY"))
+
+            p1_curr = float(p1_exec) if p1_exec is not None else float(self.get_indicative_price(c1, tp1) or pos["entry_price_1"])
+            p2_curr = float(p2_exec) if p2_exec is not None else float(self.get_indicative_price(c2, tp2) or pos["entry_price_2"])
 
             m1 = float(self.get_token_multiplier(t, c1))
             m2 = float(self.get_token_multiplier(t, c2))
@@ -892,9 +1049,8 @@ class BasisStatArbitrage(StrategyV2Base):
             curr_basis = (p1_norm - p2_norm) / p2_norm if p2_norm > 0 else 0.0
 
             # Floating PnL estimate
-            p1_entry = pos["entry_price_1"]
-            p2_entry = pos["entry_price_2"]
-            pos_size = pos["position_size"]
+            p1_entry = float(pos["entry_price_1"])
+            p2_entry = float(pos["entry_price_2"])
 
             if pos["side_1"] == "BUY":
                 l1 = (p1_curr - p1_entry) * (pos_size / p1_entry)
@@ -908,8 +1064,10 @@ class BasisStatArbitrage(StrategyV2Base):
 
             gross_pnl = l1 + l2
             fees = pos_size * 0.0005 * 4
-            carry = pos_size * pos.get("expected_daily_carry", 0.0) * (duration_s / 86400.0)
-            net_unrealized = gross_pnl - fees + carry
+            settled_funding = float(pos.get("settled_funding_pnl", 0.0))
+            indicative_carry = float(pos_size * pos.get("expected_daily_carry", 0.0) * (duration_s / 86400.0))
+
+            net_unrealized = gross_pnl - fees + settled_funding
             unrealized_pct = net_unrealized / pos_size if pos_size > 0 else 0.0
 
             active_list.append({
@@ -919,7 +1077,10 @@ class BasisStatArbitrage(StrategyV2Base):
                 "current_basis_pct": curr_basis,
                 "unrealized_trading_pnl": net_unrealized,
                 "unrealized_pnl_pct": unrealized_pct,
-                "funding_income": carry,
+                "funding_income": settled_funding,
+                "settled_funding_pnl": settled_funding,
+                "indicative_accrued_carry": indicative_carry,
+                "settlement_count": len(pos.get("funding_payments", [])),
                 "duration_seconds": duration_s,
             })
 
@@ -929,28 +1090,61 @@ class BasisStatArbitrage(StrategyV2Base):
             c1, c2 = list(self.config.connectors)[:2]
             for t in self.config.tokens:
                 try:
-                    p1 = float(self.get_safe_quote_price(c1, self.get_trading_pair_for_connector(t, c1), self.config.position_size_quote, True))
-                    p2 = float(self.get_safe_quote_price(c2, self.get_trading_pair_for_connector(t, c2), self.config.position_size_quote, True))
+                    tp1 = self.get_trading_pair_for_connector(t, c1)
+                    tp2 = self.get_trading_pair_for_connector(t, c2)
                     m1 = float(self.get_token_multiplier(t, c1))
                     m2 = float(self.get_token_multiplier(t, c2))
-                    p1_norm = p1 / m1 if m1 > 0 else p1
-                    p2_norm = p2 / m2 if m2 > 0 else p2
-                    basis_spread = (p1_norm - p2_norm) / p2_norm if p2_norm > 0 else 0.0
+                    quote_vol = self.config.position_size_quote
+
+                    # Indicative prices for display
+                    p1_ind = self.get_indicative_price(c1, tp1)
+                    p2_ind = self.get_indicative_price(c2, tp2)
+
+                    # Executable Bid/Ask quotes for determining true executable spreads
+                    p1_bid = self.get_executable_quote_price(c1, tp1, quote_vol, is_buy=False)
+                    p1_ask = self.get_executable_quote_price(c1, tp1, quote_vol, is_buy=True)
+                    p2_bid = self.get_executable_quote_price(c2, tp2, quote_vol, is_buy=False)
+                    p2_ask = self.get_executable_quote_price(c2, tp2, quote_vol, is_buy=True)
 
                     f_info = self.get_funding_info_by_token(t)
                     r1 = float(self.get_normalized_funding_rate_in_seconds(f_info, c1) * 86400)
                     r2 = float(self.get_normalized_funding_rate_in_seconds(f_info, c2) * 86400)
 
+                    if p1_bid is not None and p1_ask is not None and p2_bid is not None and p2_ask is not None:
+                        p1_bid_n = float(p1_bid) / m1
+                        p1_ask_n = float(p1_ask) / m1
+                        p2_bid_n = float(p2_bid) / m2
+                        p2_ask_n = float(p2_ask) / m2
+
+                        spread_sell1_buy2 = (p1_bid_n - p2_ask_n) / p2_ask_n
+                        spread_buy1_sell2 = (p2_bid_n - p1_ask_n) / p1_ask_n
+                        best_spread = max(spread_sell1_buy2, spread_buy1_sell2)
+
+                        thresh = float(self.config.min_entry_basis_pct)
+                        if best_spread >= thresh:
+                            dir_str = "Short C1/Long C2" if spread_sell1_buy2 >= spread_buy1_sell2 else "Long C1/Short C2"
+                            status_str = f"⚡ 偏离超标 {best_spread:+.2%} ({dir_str})"
+                        else:
+                            status_str = f"⚖️ 窄幅正常 (最高 {best_spread:+.2%})"
+
+                        display_p1 = float(p1_ind) if p1_ind is not None else float(p1_ask)
+                        display_p2 = float(p2_ind) if p2_ind is not None else float(p2_ask)
+                    else:
+                        best_spread = 0.0
+                        display_p1 = float(p1_ind) if p1_ind is not None else 0.0
+                        display_p2 = float(p2_ind) if p2_ind is not None else 0.0
+                        status_str = "⏳ 深度暂缺/无法撮合"
+
                     basis_comparison.append({
                         "token": t,
-                        "price_1": p1,
-                        "price_2": p2,
-                        "basis_spread_pct": basis_spread,
-                        "abs_basis_spread_pct": abs(basis_spread),
+                        "price_1": display_p1,
+                        "price_2": display_p2,
+                        "basis_spread_pct": best_spread,
+                        "abs_basis_spread_pct": abs(best_spread),
                         "c1_funding_daily": r1,
                         "c2_funding_daily": r2,
                         "carry_if_short_c1": r1 - r2,
-                        "dislocation_status": "⚡ 触发展开" if abs(basis_spread) >= float(self.config.min_entry_basis_pct) else "⚖️ 正常窄幅",
+                        "dislocation_status": status_str,
                     })
                 except Exception:
                     pass
