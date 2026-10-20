@@ -1,0 +1,42 @@
+# New, isolated PAPER instance only. Never reuse another running bot's data mount.
+script_file_name: v2_funding_rate_arb.py
+dry_run: true
+connectors:
+  - binance_perpetual
+  - hyperliquid_perpetual
+tokens:
+  - BTC
+  - ETH
+  - SOL
+leverage: 1
+paper_account_balance_quote: 10000
+paper_margin_reserve_pct: 0.25
+max_portfolio_drawdown_pct: 0.05
+max_concurrent_positions: 3
+paper_state_path: /home/hummingbot/data/arbitrage_trades.json
+position_size_quote: 500
+min_position_size_quote: 100
+min_funding_rate_profitability: 0.0012
+trade_profitability_condition_to_enter: false
+max_payback_hours: 12
+max_entry_spread_pct: 0.001
+max_entry_spread_friction_pct: 0.005
+max_orderbook_depth_ratio: 0.15
+max_leg_price_impact_pct: 0.002
+max_hedge_mismatch_pct: 0.001
+max_orderbook_age_seconds: 15
+max_funding_data_age_seconds: 120
+paper_maintenance_margin_pct: 0.02
+liquidation_buffer_pct: 0.08
+tier_1_liquidation_buffer: 0.08
+tier_2_liquidation_buffer: 0.08
+tier_3_liquidation_buffer: 0.12
+funding_rate_diff_stop_loss: -0.001
+entry_persistence_ticks: 3
+rate_inversion_confirmation_ticks: 3
+basis_divergence_confirmation_ticks: 5
+max_basis_loss_pct: 0.012
+profitability_to_take_profit: 0.02
+scaling_tp_enabled: false
+auto_rotation_enabled: false
+asset_graduation_enabled: false
