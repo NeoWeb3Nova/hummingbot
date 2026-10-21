@@ -145,17 +145,51 @@ class BasisStatArbitrageConfig(StrategyV2ConfigBase):
             "prompt_on_new": True
         }
     )
+    min_holding_seconds: int = Field(
+        default=60,
+        gt=0,
+        json_schema_extra={
+            "prompt": lambda mi: "Min holding seconds before allowing take-profit exit (e.g. 60): ",
+            "prompt_on_new": True
+        }
+    )
+    exit_persistence_ticks: int = Field(
+        default=2,
+        ge=1,
+        json_schema_extra={
+            "prompt": lambda mi: "Number of consecutive ticks take-profit condition must persist (e.g. 2): ",
+            "prompt_on_new": True
+        }
+    )
+    taker_fee_rate: Decimal = Field(
+        default=Decimal("0.0005"),
+        json_schema_extra={
+            "prompt": lambda mi: "Estimated taker fee rate per leg (e.g. 0.0005 for 0.05%): ",
+            "prompt_on_new": True
+        }
+    )
+    settlement_blackout_seconds: int = Field(
+        default=60,
+        json_schema_extra={
+            "prompt": lambda mi: "Seconds before settlement to avoid adverse entry (e.g. 60): ",
+            "prompt_on_new": True
+        }
+    )
 
     @field_validator("tokens", mode="before")
     def validate_tokens(cls, v):
         if isinstance(v, str):
             return [val.strip().upper() for val in v.split(",") if val.strip()]
+        if isinstance(v, (list, set, tuple)):
+            return [str(val).strip().upper() for val in v if str(val).strip()]
         return v
 
     @field_validator("connectors", mode="before")
     def validate_connectors(cls, v):
         if isinstance(v, str):
             return [val.strip().lower() for val in v.split(",") if val.strip()]
+        if isinstance(v, (list, set, tuple)):
+            return [str(val).strip().lower() for val in v if str(val).strip()]
         return v
 
     def update_markets(self, markets: MarketDict) -> MarketDict:
@@ -304,6 +338,7 @@ class BasisStatArbitrage(StrategyV2Base):
         self.active_basis_arbitrages: Dict[str, Dict] = {}
         self.stopped_basis_arbitrages: Dict[str, List[Dict]] = {}
         self.entry_candidate_ticks: Dict[str, int] = {}
+        self.exit_candidate_ticks: Dict[str, int] = {}
         self.divergence_tick_counter: Dict[str, int] = {}
         self.token_last_closed_timestamp: Dict[str, float] = {}
 
@@ -680,6 +715,29 @@ class BasisStatArbitrage(StrategyV2Base):
                 )
                 continue
 
+            # Determine next discrete settlement times
+            funding_info_1 = funding_info.get(c1)
+            funding_info_2 = funding_info.get(c2)
+            next_f1 = getattr(funding_info_1, "next_funding_utc_timestamp", 0) if funding_info_1 else 0
+            next_f2 = getattr(funding_info_2, "next_funding_utc_timestamp", 0) if funding_info_2 else 0
+            if next_f1 == 0 or next_f1 <= self.current_timestamp:
+                next_f1 = int(self.current_timestamp + self.funding_payment_interval_map.get(c1, 3600 if "hyperliquid" in c1 else 28800))
+            if next_f2 == 0 or next_f2 <= self.current_timestamp:
+                next_f2 = int(self.current_timestamp + self.funding_payment_interval_map.get(c2, 3600 if "hyperliquid" in c2 else 28800))
+
+            # Settlement Blackout Protection:
+            # If within settlement_blackout_seconds of funding settlement and carry is adverse, skip!
+            blackout_s = getattr(self.config, "settlement_blackout_seconds", 60)
+            time_to_f1 = next_f1 - self.current_timestamp
+            time_to_f2 = next_f2 - self.current_timestamp
+            if (0 <= time_to_f1 <= blackout_s or 0 <= time_to_f2 <= blackout_s) and daily_carry < 0:
+                self.logger().info(
+                    f"⏳ [SETTLEMENT-BLACKOUT] Token '{token}' within {blackout_s}s of funding settlement "
+                    f"with adverse carry ({float(daily_carry):+.2%}/d). Skipping entry."
+                )
+                self.entry_candidate_ticks[token] = 0
+                continue
+
             # Confirmed Opportunity! Reset counter and enter
             self.entry_candidate_ticks[token] = 0
             self.logger().info(
@@ -687,16 +745,6 @@ class BasisStatArbitrage(StrategyV2Base):
                 f"Entering: {c1_side.name} {c1} @ ${float(c1_exec_price):.4f} | {c2_side.name} {c2} @ ${float(c2_exec_price):.4f} | "
                 f"Indicative Carry={float(daily_carry):+.2%}/d"
             )
-
-            # Determine next discrete settlement times
-            funding_info_1 = funding_info.get(c1)
-            funding_info_2 = funding_info.get(c2)
-            next_f1 = getattr(funding_info_1, "next_funding_utc_timestamp", 0) if funding_info_1 else 0
-            next_f2 = getattr(funding_info_2, "next_funding_utc_timestamp", 0) if funding_info_2 else 0
-            if next_f1 == 0 or next_f1 <= self.current_timestamp:
-                next_f1 = int(self.current_timestamp + self.funding_payment_interval_map.get(c1, 28800))
-            if next_f2 == 0 or next_f2 <= self.current_timestamp:
-                next_f2 = int(self.current_timestamp + self.funding_payment_interval_map.get(c2, 3600 if "hyperliquid" in c2 else 28800))
 
             pos_data = {
                 "token": token,
@@ -811,8 +859,8 @@ class BasisStatArbitrage(StrategyV2Base):
             else:
                 leg2_pnl = (p2_entry - p2_curr) * (pos_size / p2_entry)
 
-            # Trading fees estimate (0.05% per leg maker/taker, roundtrip = 4 legs)
-            fee_rate = Decimal("0.0005")
+            # Explicit 4-leg Taker fee calculation (Open Leg1 + Open Leg2 + Close Leg1 + Close Leg2)
+            fee_rate = Decimal(str(getattr(self.config, "taker_fee_rate", Decimal("0.0005"))))
             est_roundtrip_fees = pos_size * fee_rate * Decimal("4")
             gross_trading_pnl = leg1_pnl + leg2_pnl
             net_trading_pnl = gross_trading_pnl - est_roundtrip_fees
@@ -830,21 +878,28 @@ class BasisStatArbitrage(StrategyV2Base):
             total_net_pnl = net_trading_pnl + settled_funding
             net_pnl_pct = total_net_pnl / pos_size if pos_size > 0 else Decimal("0")
 
+            # True ROE on real margin (Dual leg margin = (pos_size / leverage) * 2)
+            pos_leverage = Decimal(str(pos.get("leverage", self.config.leverage)))
+            real_margin = (pos_size / pos_leverage) * Decimal("2")
+            net_roe_pct = total_net_pnl / real_margin if real_margin > 0 else Decimal("0")
+
             # Update peak PnL for trailing
             peak_pnl = max(pos.get("peak_pnl_pct", 0.0), float(net_pnl_pct))
             pos["peak_pnl_pct"] = peak_pnl
 
             # ----------------- Exit Conditions -----------------
+            # Anti-HFT Churn Defense: Enforce minimum holding time before allowing normal take-profit
+            min_hold_s = getattr(self.config, "min_holding_seconds", 60)
+            is_min_hold_passed = (duration_s >= min_hold_s)
+
             # 1. Basis Compression Take-Profit:
-            # Did the basis compress from its dislocation towards 0?
             target_comp = Decimal(str(self.config.take_profit_basis_compression_pct))
             is_basis_compressed = abs(curr_basis) <= target_comp
-            # Ensure it's not a severe loss due to adverse fees
-            basis_tp_condition = is_basis_compressed and (total_net_pnl > Decimal("0"))
+            basis_tp_raw = is_basis_compressed and (total_net_pnl > Decimal("0"))
 
             # 2. Net Profit Target Take-Profit:
             net_tp_target = self.config.min_take_profit_net_pct
-            net_tp_condition = net_pnl_pct >= net_tp_target
+            net_tp_raw = net_pnl_pct >= net_tp_target
 
             # 3. Trailing Stop:
             trail_active_thresh = self.config.trailing_stop_activation_pct
@@ -853,18 +908,32 @@ class BasisStatArbitrage(StrategyV2Base):
                 pos["trailing_active"] = True
                 self.logger().info(f"🛡️ [TRAILING-ARMED] Token '{token}' net PnL reached {float(net_pnl_pct):+.2%}. Trailing stop active!")
 
-            trailing_stop_condition = (
+            trailing_stop_raw = (
                 pos.get("trailing_active", False)
                 and Decimal(str(peak_pnl)) - net_pnl_pct >= trail_distance
             )
+
+            # Normal exits require minimum holding time:
+            normal_exit_candidate = is_min_hold_passed and (basis_tp_raw or net_tp_raw or trailing_stop_raw)
+
+            # Exit persistence: require 2 consecutive ticks before closing
+            req_exit_ticks = getattr(self.config, "exit_persistence_ticks", 2)
+            if normal_exit_candidate:
+                self.exit_candidate_ticks[token] = self.exit_candidate_ticks.get(token, 0) + 1
+            else:
+                self.exit_candidate_ticks[token] = 0
+
+            is_exit_confirmed = (self.exit_candidate_ticks.get(token, 0) >= req_exit_ticks)
+
+            basis_tp_condition = is_exit_confirmed and basis_tp_raw
+            net_tp_condition = is_exit_confirmed and net_tp_raw
+            trailing_stop_condition = is_exit_confirmed and trailing_stop_raw
 
             # 4. Max Hold Timeout Expiry:
             max_h = float(self.config.max_hold_hours)
             timeout_condition = (duration_h >= max_h) and (total_net_pnl >= -pos_size * Decimal("0.003"))
 
-            # 5. Emergency Basis Divergence Stop-Loss:
-            # If basis moved in the WRONG direction by max_basis_loss_pct
-            # e.g. entry_basis > 0 (Short C1 / Long C2), but curr_basis jumped higher by 1.5%
+            # 5. Emergency Basis Divergence Stop-Loss (NEVER restricted by min holding time!):
             max_loss_pct = self.config.max_basis_loss_pct
             divergence_breach = net_pnl_pct <= -max_loss_pct
 
@@ -894,12 +963,15 @@ class BasisStatArbitrage(StrategyV2Base):
                 tokens_to_close.append({
                     "token": token,
                     "reason": reason,
+                    "gross_trading_pnl": float(gross_trading_pnl),
+                    "trading_fee": float(est_roundtrip_fees),
                     "net_trading_pnl": float(net_trading_pnl),
                     "settled_funding_pnl": float(settled_funding),
                     "indicative_accrued_carry": float(indicative_carry),
                     "funding_income": float(settled_funding),
                     "total_net_pnl": float(total_net_pnl),
                     "net_pnl_pct": float(net_pnl_pct),
+                    "net_roe_pct": float(net_roe_pct),
                     "close_p1": float(p1_curr),
                     "close_p2": float(p2_curr),
                     "close_basis_pct": float(curr_basis),
@@ -910,6 +982,9 @@ class BasisStatArbitrage(StrategyV2Base):
             token = item["token"]
             pos = self.active_basis_arbitrages.pop(token)
             self.token_last_closed_timestamp[token] = self.current_timestamp
+
+            # Count unique settlement window timestamps
+            unique_windows = len(set(p.get("timestamp") for p in pos.get("funding_payments", []) if p.get("timestamp")))
 
             record = {
                 "token": token,
@@ -925,13 +1000,17 @@ class BasisStatArbitrage(StrategyV2Base):
                 "close_basis_pct": item["close_basis_pct"],
                 "position_size": pos["position_size"],
                 "leverage": pos["leverage"],
+                "gross_trading_pnl": item["gross_trading_pnl"],
+                "trading_fee": item["trading_fee"],
+                "net_trading_pnl": item["net_trading_pnl"],
                 "trading_pnl": item["net_trading_pnl"],
                 "funding_pnl": item["settled_funding_pnl"],
                 "indicative_accrued_carry": item["indicative_accrued_carry"],
-                "settlement_count": len(pos.get("funding_payments", [])),
+                "settlement_count": unique_windows,
                 "funding_payments": pos.get("funding_payments", []),
                 "total_net_pnl": item["total_net_pnl"],
                 "net_pnl_pct": item["net_pnl_pct"],
+                "net_roe_pct": item["net_roe_pct"],
                 "close_reason": item["reason"],
                 "open_timestamp": pos["open_timestamp"],
                 "close_timestamp": self.current_timestamp,
@@ -1003,6 +1082,7 @@ class BasisStatArbitrage(StrategyV2Base):
         data = {
             "strategy": "basis_stat_arb",
             "is_dry_run": self.config.dry_run,
+            "min_holding_seconds": getattr(self.config, "min_holding_seconds", 60),
             "updated_at": datetime.now(timezone.utc).isoformat(),
             "active_positions": list(self.active_basis_arbitrages.values()),
             "closed_trades": all_closed,
@@ -1063,25 +1143,38 @@ class BasisStatArbitrage(StrategyV2Base):
                 l2 = (p2_entry - p2_curr) * (pos_size / p2_entry)
 
             gross_pnl = l1 + l2
-            fees = pos_size * 0.0005 * 4
+            fee_rate = float(getattr(self.config, "taker_fee_rate", 0.0005))
+            fees = pos_size * fee_rate * 4.0
+            net_trading = gross_pnl - fees
             settled_funding = float(pos.get("settled_funding_pnl", 0.0))
             indicative_carry = float(pos_size * pos.get("expected_daily_carry", 0.0) * (duration_s / 86400.0))
 
-            net_unrealized = gross_pnl - fees + settled_funding
+            net_unrealized = net_trading + settled_funding
             unrealized_pct = net_unrealized / pos_size if pos_size > 0 else 0.0
+
+            leverage = float(pos.get("leverage", self.config.leverage))
+            real_margin = (pos_size / leverage) * 2.0 if leverage > 0 else pos_size
+            unrealized_roe_pct = net_unrealized / real_margin if real_margin > 0 else 0.0
+
+            unique_windows = len(set(p.get("timestamp") for p in pos.get("funding_payments", []) if p.get("timestamp")))
 
             active_list.append({
                 **pos,
                 "current_price_1": p1_curr,
                 "current_price_2": p2_curr,
                 "current_basis_pct": curr_basis,
+                "gross_trading_pnl": gross_pnl,
+                "trading_fee": fees,
+                "net_trading_pnl": net_trading,
                 "unrealized_trading_pnl": net_unrealized,
                 "unrealized_pnl_pct": unrealized_pct,
+                "unrealized_roe_pct": unrealized_roe_pct,
                 "funding_income": settled_funding,
                 "settled_funding_pnl": settled_funding,
                 "indicative_accrued_carry": indicative_carry,
-                "settlement_count": len(pos.get("funding_payments", [])),
+                "settlement_count": unique_windows,
                 "duration_seconds": duration_s,
+                "min_holding_seconds": getattr(self.config, "min_holding_seconds", 60),
             })
 
         # Market basis scan comparison
