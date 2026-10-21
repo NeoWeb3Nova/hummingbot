@@ -384,13 +384,16 @@ class BasisStatArbitrage(StrategyV2Base):
                             self.stopped_basis_arbitrages[tok] = []
                         self.stopped_basis_arbitrages[tok].append(item)
                     active_list = data.get("active_positions", [])
+                    now_ts = time.time()
                     for pos in active_list:
                         tok = pos.get("token")
                         if tok and tok not in self.active_basis_arbitrages:
                             pos.setdefault("settled_funding_pnl", 0.0)
                             pos.setdefault("funding_payments", [])
-                            pos.setdefault("next_funding_time_1", int(self.current_timestamp + 28800))
-                            pos.setdefault("next_funding_time_2", int(self.current_timestamp + 3600))
+                            if "next_funding_time_1" not in pos:
+                                pos["next_funding_time_1"] = int(now_ts + 28800)
+                            if "next_funding_time_2" not in pos:
+                                pos["next_funding_time_2"] = int(now_ts + 3600)
                             self.active_basis_arbitrages[tok] = pos
                     self.logger().info(f"[BASIS-STAT-ARB] Loaded {len(closed_list)} closed trades & {len(self.active_basis_arbitrages)} active positions from {path}")
                     break
