@@ -489,6 +489,7 @@ class FundingTests(unittest.IsolatedAsyncioTestCase):
                          patch.object(source,'unsubscribe_from_trading_pair',AsyncMock(return_value=True)), \
                          patch.object(tracker,'_initial_order_book_for_trading_pair',AsyncMock(return_value=book)):
                         self.assertTrue(await conn.add_trading_pair(pair), venue)
+                        await asyncio.sleep(0)  # let the native tracking coroutine start before cancellation
                         self.assertIn(pair, tracker.order_books)
                         self.assertTrue(await conn.remove_trading_pair(pair), venue)
                         self.assertNotIn(pair, tracker.order_books)
