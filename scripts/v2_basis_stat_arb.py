@@ -1122,6 +1122,7 @@ class BasisStatArbitrage(StrategyV2Base):
         data = {
             "strategy": "basis_stat_arb",
             "is_dry_run": self.config.dry_run,
+            "leverage": self.config.leverage,
             "min_holding_seconds": getattr(self.config, "min_holding_seconds", 60),
             "updated_at": datetime.now(timezone.utc).isoformat(),
             "active_positions": list(self.active_basis_arbitrages.values()),
