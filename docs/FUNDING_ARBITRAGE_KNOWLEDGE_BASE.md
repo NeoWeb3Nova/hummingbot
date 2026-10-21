@@ -10,3 +10,8 @@ The custom scripts are synchronized with the API audit branch. Official connecto
 ## 2026-10-20：实际部署与公开模式初始化修正
 
 参见 [模拟盘部署与连续验收](FUNDING_PAPER_DEPLOYMENT_2026-10-20.md)：逐币对 readiness、公开交易规则加载、MQTT 延迟初始化、旧账本归档与工程/收益验收边界。资金费回归增至 36 项。
+
+
+## 2026-10-21：动态池实际部署与新验收窗口
+
+参见 [动态选币模拟盘部署](FUNDING_DYNAMIC_DEPLOYMENT_2026-10-21.md)：原项目已同步，新实例于 13:56 启动；真实发现池外 W 并成功完成双方订阅、完整成本拒绝与回滚。新的独立 24h 窗口于 13:57:34 开始；原过载窗口保留，盈利仍缺成交结算证据。
