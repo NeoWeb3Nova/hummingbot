@@ -740,10 +740,20 @@ class BasisStatArbitrage(StrategyV2Base):
 
             # Confirmed Opportunity! Reset counter and enter
             self.entry_candidate_ticks[token] = 0
+            c1_amount = pos_size / c1_exec_price
+            c2_amount = pos_size / c2_exec_price
+            lev_val = Decimal(str(self.config.leverage))
+            margin_1 = pos_size / lev_val if lev_val > 0 else pos_size
+            margin_2 = pos_size / lev_val if lev_val > 0 else pos_size
+            tot_margin = margin_1 + margin_2
+            tot_notional = pos_size * Decimal("2")
+
             self.logger().info(
-                f"🚀 [BASIS-ENTRY-TRIGGER] Token '{token}' confirmed executable dislocation: {float(executable_basis_spread):+.3%}! "
-                f"Entering: {c1_side.name} {c1} @ ${float(c1_exec_price):.4f} | {c2_side.name} {c2} @ ${float(c2_exec_price):.4f} | "
-                f"Indicative Carry={float(daily_carry):+.2%}/d"
+                f"🚀 [BASIS-ENTRY-TRIGGER] Token '{token}' confirmed executable dislocation: {float(executable_basis_spread):+.3%}!\n"
+                f"  Leg 1 ({c1}): {c1_side.name} {float(c1_amount):,.4f} {token} @ ${float(c1_exec_price):.4f} (货值 ${float(pos_size):,.2f} | 保证金 ${float(margin_1):,.2f})\n"
+                f"  Leg 2 ({c2}): {c2_side.name} {float(c2_amount):,.4f} {token} @ ${float(c2_exec_price):.4f} (货值 ${float(pos_size):,.2f} | 保证金 ${float(margin_2):,.2f})\n"
+                f"  Capital Sizing: 单边货值 ${float(pos_size):,.2f} | 双边总货值 ${float(tot_notional):,.2f} | 实缴总保证金 ${float(tot_margin):,.2f} ({self.config.leverage}x)\n"
+                f"  Indicative Carry: {float(daily_carry):+.2%}/d"
             )
 
             pos_data = {
@@ -753,6 +763,8 @@ class BasisStatArbitrage(StrategyV2Base):
                 "connector_2": c2,
                 "side_1": c1_side.name,
                 "side_2": c2_side.name,
+                "amount_1": float(c1_amount),
+                "amount_2": float(c2_amount),
                 "entry_price_1": float(c1_exec_price),
                 "entry_price_2": float(c2_exec_price),
                 "entry_norm_price_1": float(c1_norm),
@@ -760,7 +772,12 @@ class BasisStatArbitrage(StrategyV2Base):
                 "entry_basis_pct": float(executable_basis_spread),
                 "target_compression_pct": float(self.config.take_profit_basis_compression_pct),
                 "position_size": float(pos_size),
+                "single_notional": float(pos_size),
+                "total_notional": float(tot_notional),
                 "leverage": self.config.leverage,
+                "margin_1": float(margin_1),
+                "margin_2": float(margin_2),
+                "total_margin": float(tot_margin),
                 "open_timestamp": self.current_timestamp,
                 "expected_daily_carry": float(daily_carry),
                 "trailing_active": False,
@@ -986,12 +1003,25 @@ class BasisStatArbitrage(StrategyV2Base):
             # Count unique settlement window timestamps
             unique_windows = len(set(p.get("timestamp") for p in pos.get("funding_payments", []) if p.get("timestamp")))
 
+            pos_size_val = float(pos["position_size"])
+            p1_entry_val = float(pos["entry_price_1"])
+            p2_entry_val = float(pos["entry_price_2"])
+            amt1_val = float(pos.get("amount_1", pos_size_val / p1_entry_val if p1_entry_val > 0 else 0.0))
+            amt2_val = float(pos.get("amount_2", pos_size_val / p2_entry_val if p2_entry_val > 0 else 0.0))
+            lev_val = float(pos.get("leverage", self.config.leverage))
+            tot_notional_val = float(pos.get("total_notional", pos_size_val * 2.0))
+            margin1_val = float(pos.get("margin_1", pos_size_val / lev_val if lev_val > 0 else pos_size_val))
+            margin2_val = float(pos.get("margin_2", pos_size_val / lev_val if lev_val > 0 else pos_size_val))
+            tot_margin_val = float(pos.get("total_margin", (pos_size_val / lev_val) * 2.0 if lev_val > 0 else pos_size_val * 2.0))
+
             record = {
                 "token": token,
                 "connector_1": pos["connector_1"],
                 "connector_2": pos["connector_2"],
                 "side_1": pos["side_1"],
                 "side_2": pos["side_2"],
+                "amount_1": amt1_val,
+                "amount_2": amt2_val,
                 "entry_price_1": pos["entry_price_1"],
                 "entry_price_2": pos["entry_price_2"],
                 "close_price_1": item["close_p1"],
@@ -999,7 +1029,12 @@ class BasisStatArbitrage(StrategyV2Base):
                 "entry_basis_pct": pos["entry_basis_pct"],
                 "close_basis_pct": item["close_basis_pct"],
                 "position_size": pos["position_size"],
+                "single_notional": pos_size_val,
+                "total_notional": tot_notional_val,
                 "leverage": pos["leverage"],
+                "margin_1": margin1_val,
+                "margin_2": margin2_val,
+                "total_margin": tot_margin_val,
                 "gross_trading_pnl": item["gross_trading_pnl"],
                 "trading_fee": item["trading_fee"],
                 "net_trading_pnl": item["net_trading_pnl"],
@@ -1023,8 +1058,10 @@ class BasisStatArbitrage(StrategyV2Base):
 
             self.logger().info(
                 f"🎯 [BASIS-POSITION-CLOSED] Token '{token}' ({item['reason']})!\n"
-                f"  Trading PnL: ${item['net_trading_pnl']:+.2f}, Settled Funding: ${item['settled_funding_pnl']:+.2f} ({len(pos.get('funding_payments', []))} settlements), "
-                f"Total Net: ${item['total_net_pnl']:+.2f} ({item['net_pnl_pct']:+.2%}), Held: {item['duration_seconds'] // 60}m"
+                f"  Capital Sizing: 单边 ${pos_size_val:,.2f} | 双边 ${tot_notional_val:,.2f} | 实缴保证金 ${tot_margin_val:,.2f} ({lev_val:.0f}x)\n"
+                f"  Quantities: {pos['side_1']} {amt1_val:,.4f} {token} ({pos['connector_1']}) + {pos['side_2']} {amt2_val:,.4f} {token} ({pos['connector_2']})\n"
+                f"  Trading PnL: Gross ${item['gross_trading_pnl']:+.2f} - Fee ${item['trading_fee']:.2f} = Net ${item['net_trading_pnl']:+.2f}\n"
+                f"  Settled Funding: ${item['settled_funding_pnl']:+.2f} ({unique_windows} windows), Total Net: ${item['total_net_pnl']:+.2f} (ROE {item['net_roe_pct']:+.2%}), Held: {item['duration_seconds']}s"
             )
 
             # If real trading, stop executors
@@ -1158,11 +1195,27 @@ class BasisStatArbitrage(StrategyV2Base):
 
             unique_windows = len(set(p.get("timestamp") for p in pos.get("funding_payments", []) if p.get("timestamp")))
 
+            amt1_val = float(pos.get("amount_1", pos_size / p1_entry if p1_entry > 0 else 0.0))
+            amt2_val = float(pos.get("amount_2", pos_size / p2_entry if p2_entry > 0 else 0.0))
+            tot_notional_val = float(pos.get("total_notional", pos_size * 2.0))
+            margin1_val = float(pos.get("margin_1", pos_size / leverage if leverage > 0 else pos_size))
+            margin2_val = float(pos.get("margin_2", pos_size / leverage if leverage > 0 else pos_size))
+            tot_margin_val = float(pos.get("total_margin", real_margin))
+
             active_list.append({
                 **pos,
+                "amount_1": amt1_val,
+                "amount_2": amt2_val,
+                "single_notional": pos_size,
+                "total_notional": tot_notional_val,
+                "margin_1": margin1_val,
+                "margin_2": margin2_val,
+                "total_margin": tot_margin_val,
                 "current_price_1": p1_curr,
                 "current_price_2": p2_curr,
                 "current_basis_pct": curr_basis,
+                "leg1_trading_pnl": l1,
+                "leg2_trading_pnl": l2,
                 "gross_trading_pnl": gross_pnl,
                 "trading_fee": fees,
                 "net_trading_pnl": net_trading,
@@ -1280,10 +1333,24 @@ class BasisStatArbitrage(StrategyV2Base):
         if not self.ready_to_trade:
             return "Strategy not ready to trade."
         lines = []
-        lines.append("⚡ [Basis Stat Arbitrage + Carry Double-Dip Alpha Engine]")
+        pos_cfg = float(self.config.position_size_quote)
+        lev = self.config.leverage
+        dual_cfg = pos_cfg * 2.0
+        margin_cfg = (dual_cfg / lev) if lev > 0 else dual_cfg
+
+        lines.append("⚡ [Basis Stat Arbitrage + Carry Double-Dip Engine]")
         lines.append(f"  Mode: {'Dry-Run (Paper)' if self.config.dry_run else 'Live Real Trading'}")
-        lines.append(f"  Connectors: {', '.join(self.config.connectors)} | Leverage: {self.config.leverage}x")
+        lines.append(f"  Connectors: {', '.join(self.config.connectors)} | Leverage: {lev}x")
+        lines.append(f"  Position Sizing Matrix: 单边货值 ${pos_cfg:,.2f} | 双边总敞口 ${dual_cfg:,.2f} | 双边实缴保证金 ${margin_cfg:,.2f}")
         lines.append(f"  Active Positions: {len(self.active_basis_arbitrages)}")
+        for tok, pos in self.active_basis_arbitrages.items():
+            amt1 = float(pos.get("amount_1", float(pos["position_size"]) / float(pos["entry_price_1"]) if float(pos["entry_price_1"]) > 0 else 0.0))
+            amt2 = float(pos.get("amount_2", float(pos["position_size"]) / float(pos["entry_price_2"]) if float(pos["entry_price_2"]) > 0 else 0.0))
+            lines.append(
+                f"    - {tok}: {pos['side_1']} {amt1:,.2f} @ ${pos['entry_price_1']:.4f} ({pos['connector_1']}) "
+                f"+ {pos['side_2']} {amt2:,.2f} @ ${pos['entry_price_2']:.4f} ({pos['connector_2']}) "
+                f"[单边 ${pos['position_size']:,.0f} | 双边 ${pos['position_size']*2:,.0f} | 保证金 ${(pos['position_size']/pos['leverage'])*2:,.0f}]"
+            )
         all_closed = sum(len(l) for l in self.stopped_basis_arbitrages.values())
         lines.append(f"  Closed Trades: {all_closed}")
         return "\n".join(lines)
