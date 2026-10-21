@@ -238,8 +238,8 @@ class FundingRateArbitrageConfig(StrategyV2ConfigBase):
         default=True,
         json_schema_extra={"prompt": lambda mi: "Enable autonomous token universe rotation? (True/False): ", "prompt_on_new": False}
     )
-    auto_rotation_interval_minutes: int = Field(
-        default=30,
+    auto_rotation_interval_minutes: float = Field(
+        default=0.5, ge=0.1667,
         json_schema_extra={"prompt": lambda mi: "Interval in minutes between full market rotation checks (e.g. 30): ", "prompt_on_new": False}
     )
     auto_rotation_min_apr: float = Field(
@@ -247,17 +247,27 @@ class FundingRateArbitrageConfig(StrategyV2ConfigBase):
         json_schema_extra={"prompt": lambda mi: "Minimum APR required for candidate tokens to enter universe (e.g. 0.35 for 35%): ", "prompt_on_new": False}
     )
     auto_rotation_min_apr_delta: float = Field(
-        default=0.40,
-        json_schema_extra={"prompt": lambda mi: "Minimum APR advantage over idle token to trigger rotation (e.g. 0.40 for 40%): ", "prompt_on_new": False}
+        default=0.05, ge=0,
+        json_schema_extra={"prompt": lambda mi: "Minimum annualized net capital return advantage for idle-token rotation (0.05 = 5 percentage points): ", "prompt_on_new": False}
     )
     auto_rotation_max_active_tokens: int = Field(
-        default=6,
+        default=12, ge=1, le=30,
         json_schema_extra={"prompt": lambda mi: "Maximum number of tokens in active watchlist (e.g. 6): ", "prompt_on_new": False}
     )
     auto_rotation_min_volume_24h_usd: float = Field(
         default=2000000.0,
         json_schema_extra={"prompt": lambda mi: "Minimum 24h volume USD to qualify for auto-rotation (e.g. 2000000.0): ", "prompt_on_new": False}
     )
+
+    funding_signal_min_snapshots: int = Field(default=3, ge=1, le=10)
+    funding_signal_min_seconds: float = Field(default=30, ge=0, le=300)
+    universe_min_secondary_volume_quote: Decimal = Field(default=Decimal('500000'), ge=0)
+    universe_volume_refresh_seconds: float = Field(default=300, ge=30)
+    universe_mount_timeout_seconds: float = Field(default=20, ge=1, le=60)
+    universe_min_residence_seconds: float = Field(default=300, ge=0)
+    universe_failed_candidate_cooldown_seconds: float = Field(default=300, ge=30)
+    universe_max_probes_per_scan: int = Field(default=3, ge=1, le=10)
+    universe_max_rotations_per_scan: int = Field(default=2, ge=1, le=5)
 
     # --- v1.3.0 Tier-Aware Dynamic Liquidation Buffers ---
     tier_1_liquidation_buffer: Decimal = Field(
@@ -376,6 +386,8 @@ class FundingRateArbitrageConfig(StrategyV2ConfigBase):
             raise ValueError("partial_tp_ratio must be strictly between zero and one")
         if not 0 <= self.breakeven_trailing_stop_pct < self.breakeven_trailing_activation_pct:
             raise ValueError("trailing stop must be below its positive activation threshold")
+        if self.funding_signal_min_seconds > (self.funding_signal_min_snapshots-1)*self.max_funding_data_age_seconds:
+            raise ValueError('funding confirmation duration cannot exceed its bounded observation window')
         object.__setattr__(self, "tokens", {FundingRateArbitrage.get_canonical_token(t.strip()).upper() for t in self.tokens if t.strip()})
         return self
 
@@ -716,77 +728,13 @@ class FundingRateArbitrage(StrategyV2Base):
                 self.logger().warning(f"[COMMAND] Failed processing strategy command: {e}")
 
     def check_universe_auto_rotation(self):
-        """
-        Periodically evaluate cross-exchange perpetual universe and rotate stale idle tokens.
-        """
-        if not getattr(self.config, "auto_rotation_enabled", True):
-            return
-        if getattr(self, "is_rotating", False):
-            return
-        now = self.current_timestamp
-        interval_sec = float(getattr(self.config, "auto_rotation_interval_minutes", 30)) * 60.0
-        if not hasattr(self, "_last_rotation_check_ts") or self._last_rotation_check_ts == 0.0:
-            # On startup, give 60s for connectors to establish streams before initial scan
-            self._last_rotation_check_ts = now - interval_sec + 60.0
-        if now - self._last_rotation_check_ts >= interval_sec:
-            self._last_rotation_check_ts = now
-            self.audit._spawn(self.run_universe_auto_rotation(force=False))
+        self.audit.universe.schedule()
 
     async def async_add_token(self, token: str) -> bool:
-        """
-        Dynamically add a token to connector WebSocket streams and strategy watchlist without restart.
-        """
-        token = self.get_canonical_token(token).upper()
-        if token in self.config.tokens:
-            self.logger().info(f"[DYNAMIC-MARKET] Token {token} already in active watchlist.")
-            return True
-        self.logger().info(f"[DYNAMIC-MARKET] Dynamically mounting token {token} to connectors...")
-        for c_name in self.connectors:
-            connector = self.connectors[c_name]
-            pair = self.get_trading_pair_for_connector(token, c_name)
-            if hasattr(connector, "add_trading_pair"):
-                try:
-                    success = await connector.add_trading_pair(pair)
-                    if not success:
-                        self.logger().warning(f"[DYNAMIC-MARKET] Connector {c_name} reported failure adding {pair}")
-                        return False
-                except Exception as e:
-                    self.logger().warning(f"[DYNAMIC-MARKET] Error adding {pair} on {c_name}: {e}")
-                    return False
-        if isinstance(self.config.tokens, list):
-            self.config.tokens.append(token)
-        elif isinstance(self.config.tokens, set):
-            self.config.tokens.add(token)
-        self.stopped_funding_arbitrages.setdefault(token, [])
-        self.logger().info(f"[DYNAMIC-MARKET] Successfully mounted {token} to watchlist: {list(self.config.tokens)}")
-        self._sync_tokens_to_config_files()
-        return True
+        return await self.audit.universe.add(token)
 
     async def async_remove_token(self, token: str) -> bool:
-        """
-        Dynamically remove a token from active watchlist and unregister from connectors if no active position.
-        """
-        token = self.get_canonical_token(token).upper()
-        self.logger().info(f"[DYNAMIC-MARKET] Requesting dynamic removal of token {token}...")
-        if token in self.config.tokens:
-            if isinstance(self.config.tokens, list):
-                self.config.tokens.remove(token)
-            elif isinstance(self.config.tokens, set):
-                self.config.tokens.discard(token)
-        if token not in self.active_funding_arbitrages:
-            for c_name in self.connectors:
-                connector = self.connectors[c_name]
-                pair = self.get_trading_pair_for_connector(token, c_name)
-                if hasattr(connector, "remove_trading_pair"):
-                    try:
-                        await connector.remove_trading_pair(pair)
-                    except Exception as e:
-                        self.logger().warning(f"[DYNAMIC-MARKET] Error unmounting {pair} on {c_name}: {e}")
-            self.logger().info(f"[DYNAMIC-MARKET] Successfully unmounted market {token} from connectors")
-        else:
-            self.logger().info(f"[DYNAMIC-MARKET] Token {token} has active position; market will remain mounted until graceful exit completes.")
-        self._sync_tokens_to_config_files()
-        return True
+        return await self.audit.universe.remove(token)
 
     def _sync_tokens_to_config_files(self):
         # Persist the universe in the same atomic state as positions. Rewriting
@@ -795,151 +743,10 @@ class FundingRateArbitrage(StrategyV2Base):
 
 
     async def run_universe_auto_rotation(self, force: bool = False):
-        """
-        Execute full market radar scan and rotate idle low-yield tokens to high-APR candidates.
-        """
-        if self.is_rotating:
-            return
-        self.is_rotating = True
-        try:
-            self.logger().info(f"[AUTO-ROTATION] Starting universe opportunity scan (force={force})...")
-            candidates = await asyncio.to_thread(self._fetch_market_rotation_candidates)
-            if not candidates:
-                self.logger().info("[AUTO-ROTATION] No viable cross-exchange market candidates found.")
-                return
-
-            min_apr = float(getattr(self.config, "auto_rotation_min_apr", 0.35))
-            min_delta = float(getattr(self.config, "auto_rotation_min_apr_delta", 0.40))
-            max_tokens = int(getattr(self.config, "auto_rotation_max_active_tokens", 6))
-
-            # Filter candidates above threshold and not quarantined or permanently blacklisted
-            viable_candidates = [
-                c for c in candidates
-                if c["apr"] >= min_apr * 100.0
-                and c["token"] not in self.token_quarantine_ledger
-                and c["token"] not in self.token_permanent_blacklist
-                and c["token"] not in self.config.tokens
-            ]
-
-            current_tokens = list(self.config.tokens)
-            idle_tokens = [t for t in current_tokens if t not in self.active_funding_arbitrages]
-
-            top_cand_preview = [f"{c['token']} ({c['apr']:+.1f}%)" for c in viable_candidates[:5]]
-            self.logger().info(
-                f"[AUTO-ROTATION] Watchlist: {len(current_tokens)} tokens (Idle: {idle_tokens}). "
-                f"Top viable candidates: {top_cand_preview}"
-            )
-
-            # 1. If watchlist is below max_tokens, simply add top candidate
-            if len(current_tokens) < max_tokens and viable_candidates:
-                cand = viable_candidates.pop(0)
-                success = await self.async_add_token(cand["token"])
-                if success:
-                    event = {
-                        "timestamp": int(self.current_timestamp),
-                        "retired_token": "NONE (Slot Expansion)",
-                        "retired_apr": 0.0,
-                        "added_token": cand["token"],
-                        "added_apr": cand["apr"],
-                        "apr_delta": cand["apr"],
-                        "reason": f"Slot Expansion: Added high-yield candidate {cand['token']} ({cand['apr']:+.1f}% APR)"
-                    }
-                    self.rotation_event_history.insert(0, event)
-                    self.rotation_event_history = self.rotation_event_history[:25]
-                    self.last_rotation_timestamp = self.current_timestamp
-                    return
-
-            # 2. Check if an idle token should be rotated out
-            idle_apr_map = {}
-            for t in idle_tokens:
-                if t in self.token_quarantine_ledger:
-                    idle_apr_map[t] = -9999.0
-                    continue
-                try:
-                    f_rep = self.get_funding_info_by_token(t)
-                    best = self.get_most_profitable_combination(f_rep)
-                    idle_apr_map[t] = (best[3] * 365.0 * 100.0) if best else 0.0
-                except Exception:
-                    idle_apr_map[t] = 0.0
-
-            sorted_idle = sorted(idle_apr_map.keys(), key=lambda t: idle_apr_map[t])
-
-            for idle_tok in sorted_idle:
-                idle_apr = idle_apr_map[idle_tok]
-                if not viable_candidates:
-                    break
-                best_cand = viable_candidates[0]
-                cand_tok = best_cand["token"]
-                cand_apr = best_cand["apr"]
-                delta_apr = cand_apr - idle_apr
-
-                is_quarantined = (idle_tok in self.token_quarantine_ledger)
-                is_stale_low = (idle_apr < 5.0 and cand_apr >= min_apr * 100.0)
-                has_major_delta = (delta_apr >= min_delta * 100.0)
-
-                if is_quarantined or is_stale_low or has_major_delta or force:
-                    viable_candidates.pop(0)
-                    self.logger().info(
-                        f"[AUTO-ROTATION] Evicting idle token {idle_tok} (APR {idle_apr:+.1f}%) -> "
-                        f"Injecting candidate {cand_tok} (APR {cand_apr:+.1f}%, ΔAPR {delta_apr:+.1f}%)..."
-                    )
-                    await self.async_remove_token(idle_tok)
-                    success = await self.async_add_token(cand_tok)
-                    if success:
-                        reason_desc = (
-                            f"Quarantine Eviction ({idle_tok})" if is_quarantined else
-                            (f"Stale Low APR Eviction ({idle_tok} {idle_apr:+.1f}%)" if is_stale_low else
-                             f"Yield Super-Spread (ΔAPR {delta_apr:+.1f}%)")
-                        )
-                        event = {
-                            "timestamp": int(self.current_timestamp),
-                            "retired_token": idle_tok,
-                            "retired_apr": float(idle_apr),
-                            "added_token": cand_tok,
-                            "added_apr": float(cand_apr),
-                            "apr_delta": float(delta_apr),
-                            "reason": f"Auto-Rotation: {reason_desc} replaced by {cand_tok} ({cand_apr:+.1f}% APR)"
-                        }
-                        self.rotation_event_history.insert(0, event)
-                        self.rotation_event_history = self.rotation_event_history[:25]
-                        self.last_rotation_timestamp = self.current_timestamp
-                        self.logger().info(f"[AUTO-ROTATION] Completed rotation: {event['reason']}")
-                        break
-        except Exception as e:
-            self.logger().warning(f"[AUTO-ROTATION] Error during universe rotation: {e}")
-        finally:
-            self.is_rotating = False
+        await self.audit.universe.scan(force=force)
 
     def _fetch_market_rotation_candidates(self) -> List[Dict]:
-        from scripts import funding_arb_public_data as public
-        try:
-            metadata = public.metadata_snapshot()
-            volumes = public.request_json("https://fapi.binance.com/fapi/v1/ticker/24hr")
-            bn_volume = {r["symbol"]: dec(r["quoteVolume"], nonnegative=True) for r in volumes}
-            contexts = public.request_json("https://api.hyperliquid.xyz/info", {"type": "metaAndAssetCtxs"})
-            hl_volume = {a["name"]: dec(r["dayNtlVlm"], nonnegative=True) for a,r in zip(contexts[0]["universe"],contexts[1]) if not a.get("isDelisted")}
-            results = []
-            for symbol, volume in hl_volume.items():
-                token = self.get_canonical_token(symbol, public.HYPERLIQUID)
-                hp = self.get_trading_pair_for_connector(token, public.HYPERLIQUID)
-                bp = self.get_trading_pair_for_connector(token, public.BINANCE)
-                # Do not guess symbol collisions: both resolved instruments must exist.
-                if hp != symbol + "-USD" or (public.HYPERLIQUID,hp) not in metadata or (public.BINANCE,bp) not in metadata:
-                    continue
-                h, b = metadata[(public.HYPERLIQUID,hp)], metadata[(public.BINANCE,bp)]
-                bvol = bn_volume.get(bp.replace("-", ""), Decimal("0"))
-                if bvol < dec(self.config.auto_rotation_min_volume_24h_usd) or volume < Decimal("500000"):
-                    continue
-                ph = h["mark_price"] / dec(self.get_token_multiplier(token,public.HYPERLIQUID))
-                pb = b["mark_price"] / dec(self.get_token_multiplier(token,public.BINANCE))
-                if abs(ph-pb)/pb > min(self.config.max_allowed_price_divergence, self.config.max_entry_spread_pct):
-                    continue
-                diff = abs(h["rate"]/h["interval"] - b["rate"]/b["interval"])*86400
-                results.append(dict(token=token,apr=float(diff*365*100),daily_diff=float(diff*100),bn_vol=float(bvol),hl_vol=float(volume)))
-            return sorted(results,key=lambda r:(-r["apr"],r["token"]))
-        except Exception as exc:
-            self.logger().warning("[AUTO-ROTATION] Public schedule/metadata unavailable: %s",exc)
-            return []
+        return self.audit.universe.fetch_candidates()
 
 
     # --- v1.5.0 Asset Graduation & Rehabilitation Engine ---

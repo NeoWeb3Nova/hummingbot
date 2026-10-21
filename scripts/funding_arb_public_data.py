@@ -63,10 +63,20 @@ def metadata_snapshot():
                 "mark_price": dec(row["markPx"], positive=True),
                 "index_price": dec(row["oraclePx"], positive=True),
                 "observed_at": observed, "source": "hyperliquid_public_metadata",
+                "volume_24h": dec(row.get("dayNtlVlm", 0), nonnegative=True),
             }
         except (KeyError, ValueError):
             continue
     return result
+
+
+def volume_snapshot():
+    """One batch read, cached by the universe manager; no per-market polling."""
+    rows = request_json('https://fapi.binance.com/fapi/v1/ticker/24hr')
+    if not isinstance(rows, list):
+        raise MarketUnavailable('unexpected public volume response')
+    return {r['symbol'][:-4]+'-USDT': dec(r['quoteVolume'], nonnegative=True)
+            for r in rows if r.get('symbol', '').endswith('USDT')}
 
 
 def funding_history(connector, trading_pair, start_seconds, end_seconds):

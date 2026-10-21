@@ -20,6 +20,7 @@ from types import SimpleNamespace
 from hummingbot.core.data_type.common import OrderType, PositionAction, TradeType
 
 from scripts import funding_arb_public_data as public_data
+from scripts.funding_arb_universe import FundingUniverse, entry_rank
 from scripts.funding_arb_accounting import (
     MODEL_VERSION, ONE, SCHEMA_VERSION, ZERO, MarketUnavailable, atomic_json,
     dec, fill_base, fill_quote, funding_payment, is_buy, liquidation_estimate,
@@ -54,6 +55,8 @@ class FundingArbSafety:
         self.mqtt_retry_at = 0.0
         self.market_health_at = 0.0
         self.market_health = {}
+        self.universe = FundingUniverse(self)
+        self.metadata_status = {}
 
     @property
     def path(self):
@@ -132,6 +135,9 @@ class FundingArbSafety:
             status = data.get("rotation_status", {})
             self.s.rotation_event_history = status.get("rotation_events", [])
             self.s.last_rotation_timestamp = float(status.get("last_rotation_timestamp", 0))
+            universe_state = status.get('discovery', {}).get('state', {})
+            self.universe.admitted_at = dict(universe_state.get('admitted_at', {}))
+            self.universe.cooldowns = dict(universe_state.get('cooldowns', {}))
             audit = data.get("audit", {})
             self.audit_started_at = audit.get("started_at", timestamp)
             self.rejections.update(audit.get("rejections", {}))
@@ -185,14 +191,29 @@ class FundingArbSafety:
             self.rules_jobs.discard(name)
 
     async def _refresh_metadata(self):
+        started = time.monotonic()
+        self.metadata_status['last_attempt_at'] = self.s.current_timestamp
         try:
             snapshot = await asyncio.to_thread(public_data.metadata_snapshot)
             self.metadata = snapshot
+            self.metadata_status.update(last_success_at=self.s.current_timestamp,
+                                        markets=len(snapshot), last_error=None)
+            # Discovery needs wide forecasts, not hundreds of unused price deques.
+            # Keep settlement references for watched, held and pending positions.
+            reference_tokens = set(self.s.config.tokens) | {p['token'] for p in self._funding_targets()}
+            reference_keys = {(c,self.s.get_trading_pair_for_connector(t,c))
+                              for t in reference_tokens for c in self.s.connectors}
+            self.reference_prices = {k:v for k,v in self.reference_prices.items() if k in reference_keys}
             for key, value in snapshot.items():
+                if key not in reference_keys:
+                    continue
                 observations = self.reference_prices.setdefault(key, deque(maxlen=360))
                 observations.append((float(value["observed_at"]), value["index_price"], value["mark_price"]))
         except Exception as exc:
+            self.metadata_status['last_error'] = str(exc)
             self.s.logger().warning("[PUBLIC-METADATA] %s; stale data cannot permit new entries.", exc)
+        finally:
+            self.metadata_status['last_duration_seconds'] = time.monotonic()-started
 
     def funding_info(self, token):
         report = {}
@@ -451,6 +472,8 @@ class FundingArbSafety:
         if expected < dec(self.s.config.min_funding_rate_profitability):
             raise MarketUnavailable("matched-quantity funding spread below threshold")
         pos.update(expected_profitability=expected, entry_profitability_after_fees=immediate["trading_pnl"] / effective,
+                   selection_expected_net_quote=carry_per_second*3600*12-friction,
+                   selection_horizon_hours=12, selection_forecast_kind='constant_current_rates_after_full_friction',
                    payback_hours=float(payback), entry_friction_pct=float(friction / effective),
                    min_hold_hours=max(float(self.s.config.min_holding_hours_floor), float(payback) * self.s.config.duration_linked_holding_factor),
                    regime_tier="TIER_1_SURFING" if payback <= 8 and expected * 365 >= Decimal("0.8") else "TIER_2_FARMING")
@@ -523,14 +546,13 @@ class FundingArbSafety:
         if not self.s.config.dry_run:
             raise RuntimeError("live execution is disabled pending paired-fill reconciliation")
         blocked = self._entry_block()
+        candidates = []
         for token in sorted(self.s.config.tokens):
             if token in self.s.active_funding_arbitrages:
                 continue
             try:
                 if blocked:
                     raise MarketUnavailable(blocked)
-                if len(self.s.active_funding_arbitrages) >= self.s.config.max_concurrent_positions:
-                    raise MarketUnavailable("position slot limit")
                 if token in self.s.token_permanent_blacklist and token not in self.s.probationary_tokens:
                     raise MarketUnavailable("permanent blacklist")
                 if self.s.token_quarantine_ledger.get(token, {}).get("quarantine_until", 0) > self.s.current_timestamp:
@@ -547,6 +569,11 @@ class FundingArbSafety:
                 c1, c2, side, expected = best
                 if expected < dec(self.s.config.min_funding_rate_profitability):
                     raise MarketUnavailable("funding forecast below threshold")
+                if not self.universe.signals.ready(token, (c1,c2,is_buy(side)), info,
+                        self.s.current_timestamp, samples=self.s.config.funding_signal_min_snapshots,
+                        seconds=self.s.config.funding_signal_min_seconds,
+                        maximum_age=self.s.config.max_funding_data_age_seconds):
+                    raise MarketUnavailable('awaiting independent funding snapshots')
                 tier = self.s.get_token_tier(token)[0]
                 blackout_applies = tier == 3 if self.s.config.settlement_blackout_tier3_only else tier > 1
                 if blackout_applies and any(0 <= v.next_funding_utc_timestamp - self.s.current_timestamp <= self.s.config.settlement_blackout_minutes * 60
@@ -569,20 +596,34 @@ class FundingArbSafety:
                 self.s.entry_candidate_ticks[token] = self.s.entry_candidate_ticks.get(token, 0) + 1
                 if self.s.entry_candidate_ticks[token] < self.s.config.entry_persistence_ticks:
                     continue
-                self.s.entry_candidate_ticks[token] = 0
+                candidates.append(pos)
+            except (MarketUnavailable, KeyError, ValueError) as exc:
+                if str(exc) in ('funding forecast below threshold','no valid funding spread',
+                                'funding metadata missing or stale','funding schedule invalid'):
+                    self.universe.signals.reset(token)
+                self.reject(token, str(exc))
+        for proposal in sorted(candidates, key=entry_rank):
+            token = proposal['token']
+            try:
+                if self._entry_block():
+                    raise MarketUnavailable(self._entry_block())
+                if len(self.s.active_funding_arbitrages) >= self.s.config.max_concurrent_positions:
+                    raise MarketUnavailable('position slot limit')
+                # Reprice and reserve against the portfolio after every preceding admission.
+                pos = self.universe._forecast_position(token)
                 values, _, _ = self.value(pos)
-                pos["valuation"] = values
-                pos["valuation_status"] = "valid"
+                pos['valuation'], pos['valuation_status'] = values, 'valid'
                 self.s.active_funding_arbitrages[token] = pos
-                if token in self.s.probationary_tokens:
-                    self.s.probationary_tokens[token]["probe_executed"] = True
                 try:
-                    self.persist()  # write before accepting another opportunity
+                    self.persist()
                 except Exception as exc:
                     del self.s.active_funding_arbitrages[token]
-                    self.blocked_reason = f"state persistence failed: {exc}"
+                    self.blocked_reason = f'state persistence failed: {exc}'
                     raise MarketUnavailable(self.blocked_reason) from exc
-                self.s.logger().info("[AUDITED-PAPER-OPEN] %s quantity-matched; payback %.2fh; no real orders.", token, pos["payback_hours"])
+                self.s.entry_candidate_ticks[token] = 0
+                if token in self.s.probationary_tokens:
+                    self.s.probationary_tokens[token]['probe_executed'] = True
+                self.s.logger().info('[AUDITED-PAPER-OPEN] %s ranked after fees; payback %.2fh; no real orders.',token,pos['payback_hours'])
             except (MarketUnavailable, KeyError, ValueError) as exc:
                 self.reject(token, str(exc))
         return []
@@ -829,10 +870,12 @@ class FundingArbSafety:
                 "permanent_blacklist": sorted(self.s.token_permanent_blacklist), "probationary_tokens": copy.deepcopy(self.s.probationary_tokens),
                 "post_tp_lockout": {t: {"lockout_until": ts, "remaining_seconds": max(0, ts-now)} for t, ts in self.s.token_post_tp_lockout.items()},
                 "rotation_status": {"auto_rotation_enabled": self.s.config.auto_rotation_enabled,
+                                    "discovery": self.universe.report(),
                                     "rotation_events": self.s.rotation_event_history, "last_rotation_timestamp": self.s.last_rotation_timestamp},
                 "graduation_status": {"asset_graduation_enabled": self.s.config.asset_graduation_enabled},
                 "performance": performance, "paper_account": state,
                 "audit": {"started_at": self.audit_started_at, "blocked_reason": self.blocked_reason,
+                          "data_refresh": dict(self.metadata_status),
                           "mqtt_delivery": self.mqtt_status,
                           "public_connectors": copy.deepcopy(self.market_health),
                           "rejections": dict(self.rejections), "last_rejection": copy.deepcopy(self.last_rejection),

@@ -80,7 +80,8 @@ class Fixture:
 
     def __init__(self, path, **config):
         self.config = FundingRateArbitrageConfig(tokens={'BTC'}, paper_state_path=str(path),
-            position_size_quote=D('1000'), entry_persistence_ticks=2, **config)
+            position_size_quote=D('1000'), entry_persistence_ticks=2,
+            funding_signal_min_snapshots=1, funding_signal_min_seconds=0, **config)
         self.current_timestamp = NOW
         self.connectors = {c: Connector(c) for c in (BN, HL)}
         self.books = {c: Book() for c in (BN, HL)}
@@ -481,6 +482,22 @@ class FundingTests(unittest.IsolatedAsyncioTestCase):
         await self.s.audit._refresh_public_rules(BN,conn)
         self.assertEqual(conn._update_trading_rules.await_count,2)
         self.assertNotIn(BN,self.s.audit.rules_jobs)
+
+
+class UniverseConfigTests(unittest.TestCase):
+    def test_dynamic_defaults_enable_bounded_independent_discovery(self):
+        config = FundingRateArbitrageConfig()
+        self.assertTrue(config.auto_rotation_enabled)
+        self.assertEqual(config.auto_rotation_interval_minutes, .5)
+        self.assertEqual(config.auto_rotation_max_active_tokens, 12)
+        self.assertEqual(config.funding_signal_min_snapshots, 3)
+        self.assertLessEqual(config.max_payback_hours, D('12'))
+
+    def test_impossible_confirmation_and_unbounded_refresh_are_rejected(self):
+        with self.assertRaises(ValidationError):
+            FundingRateArbitrageConfig(funding_signal_min_snapshots=1, funding_signal_min_seconds=30)
+        with self.assertRaises(ValidationError):
+            FundingRateArbitrageConfig(auto_rotation_interval_minutes=0)
 
 
 class PublicDataTests(unittest.TestCase):
