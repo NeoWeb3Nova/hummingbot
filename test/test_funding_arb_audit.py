@@ -468,6 +468,30 @@ class FundingTests(unittest.IsolatedAsyncioTestCase):
                     conn = ConnectorManager.create_connector(manager,venue,trading_pairs=[],trading_required=True,
                                                             api_keys={'irrelevant_secret':'must-not-be-used'})
                     self.assertFalse(conn._trading_required)
+                    self.assertTrue(callable(getattr(conn,'add_trading_pair',None)), venue)
+                    self.assertTrue(callable(getattr(conn,'remove_trading_pair',None)), venue)
+                    source = conn._orderbook_ds
+                    self.assertTrue(callable(getattr(source,'subscribe_to_trading_pair',None)), venue)
+                    self.assertTrue(callable(getattr(source,'unsubscribe_from_trading_pair',None)), venue)
+                    # Exercise the actual native add/remove pipeline. Only external
+                    # subscription transport and initial data are controlled.
+                    from hummingbot.core.data_type.funding_info import FundingInfo
+                    from hummingbot.core.data_type.order_book import OrderBook
+                    from hummingbot.core.data_type.order_book_row import OrderBookRow
+                    pair = 'BTC-USDT' if venue == BN else 'BTC-USD'
+                    book = OrderBook()
+                    book.apply_snapshot([OrderBookRow(99,10,1)],[OrderBookRow(101,10,1)],1)
+                    tracker = conn.order_book_tracker
+                    tracker._order_books_initialized.set()
+                    funding = FundingInfo(pair,D('100'),D('100'),NOW+3600,D('.001'))
+                    with patch.object(source,'get_funding_info',AsyncMock(return_value=funding)), \
+                         patch.object(source,'subscribe_to_trading_pair',AsyncMock(return_value=True)), \
+                         patch.object(source,'unsubscribe_from_trading_pair',AsyncMock(return_value=True)), \
+                         patch.object(tracker,'_initial_order_book_for_trading_pair',AsyncMock(return_value=book)):
+                        self.assertTrue(await conn.add_trading_pair(pair), venue)
+                        self.assertIn(pair, tracker.order_books)
+                        self.assertTrue(await conn.remove_trading_pair(pair), venue)
+                        self.assertNotIn(pair, tracker.order_books)
                     if venue == HL:
                         self.assertIsNone(conn.hyperliquid_perpetual_secret_key)
                     else:
