@@ -743,18 +743,28 @@ class BasisStatArbitrage(StrategyV2Base):
 
             # Confirmed Opportunity! Reset counter and enter
             self.entry_candidate_ticks[token] = 0
-            c1_amount = pos_size / c1_exec_price
-            c2_amount = pos_size / c2_exec_price
+            # Sizing by uniform base token quantity (Coin-Neutral / Delta-Zero)
+            # Ensures Leg 1 and Leg 2 hold strictly identical base coin amounts (Q1 == Q2)
+            # Sized using the higher price leg so neither leg exceeds position_size_quote
+            max_exec_p = max(c1_exec_price, c2_exec_price)
+            hedged_amount = pos_size / max_exec_p if max_exec_p > 0 else Decimal("0")
+            c1_amount = hedged_amount
+            c2_amount = hedged_amount
+
+            notional_1 = c1_amount * c1_exec_price
+            notional_2 = c2_amount * c2_exec_price
+            tot_notional = notional_1 + notional_2
+
             lev_val = Decimal(str(self.config.leverage))
-            margin_1 = pos_size / lev_val if lev_val > 0 else pos_size
-            margin_2 = pos_size / lev_val if lev_val > 0 else pos_size
+            margin_1 = notional_1 / lev_val if lev_val > 0 else notional_1
+            margin_2 = notional_2 / lev_val if lev_val > 0 else notional_2
             tot_margin = margin_1 + margin_2
-            tot_notional = pos_size * Decimal("2")
 
             self.logger().info(
                 f"🚀 [BASIS-ENTRY-TRIGGER] Token '{token}' confirmed executable dislocation: {float(executable_basis_spread):+.3%}!\n"
-                f"  Leg 1 ({c1}): {c1_side.name} {float(c1_amount):,.4f} {token} @ ${float(c1_exec_price):.4f} (货值 ${float(pos_size):,.2f} | 保证金 ${float(margin_1):,.2f})\n"
-                f"  Leg 2 ({c2}): {c2_side.name} {float(c2_amount):,.4f} {token} @ ${float(c2_exec_price):.4f} (货值 ${float(pos_size):,.2f} | 保证金 ${float(margin_2):,.2f})\n"
+                f"  Coin-Neutral Alignment: {float(hedged_amount):,.4f} {token} (Delta-Zero Q1 == Q2)\n"
+                f"  Leg 1 ({c1}): {c1_side.name} {float(c1_amount):,.4f} {token} @ ${float(c1_exec_price):.4f} (货值 ${float(notional_1):,.2f} | 保证金 ${float(margin_1):,.2f})\n"
+                f"  Leg 2 ({c2}): {c2_side.name} {float(c2_amount):,.4f} {token} @ ${float(c2_exec_price):.4f} (货值 ${float(notional_2):,.2f} | 保证金 ${float(margin_2):,.2f})\n"
                 f"  Capital Sizing: 单边货值 ${float(pos_size):,.2f} | 双边总货值 ${float(tot_notional):,.2f} | 实缴总保证金 ${float(tot_margin):,.2f} ({self.config.leverage}x)\n"
                 f"  Indicative Carry: {float(daily_carry):+.2%}/d"
             )
@@ -801,7 +811,7 @@ class BasisStatArbitrage(StrategyV2Base):
                     trading_pair=tp1,
                     side=c1_side,
                     entry_price=c1_exec_price,
-                    amount=pos_size / c1_exec_price,
+                    amount=hedged_amount,
                     leverage=self.config.leverage,
                     triple_barrier_config=TripleBarrierConfig(open_order_type=OrderType.MARKET),
                 )
@@ -811,7 +821,7 @@ class BasisStatArbitrage(StrategyV2Base):
                     trading_pair=tp2,
                     side=c2_side,
                     entry_price=c2_exec_price,
-                    amount=pos_size / c2_exec_price,
+                    amount=hedged_amount,
                     leverage=self.config.leverage,
                     triple_barrier_config=TripleBarrierConfig(open_order_type=OrderType.MARKET),
                 )
@@ -867,21 +877,27 @@ class BasisStatArbitrage(StrategyV2Base):
             entry_basis = Decimal(str(pos["entry_basis_pct"]))
 
             # Trading PnL calculation:
+            # Coin quantities from stored position (strictly aligned Coin-Neutral / Delta-Zero)
+            amt1 = Decimal(str(pos.get("amount_1", pos_size / p1_entry)))
+            amt2 = Decimal(str(pos.get("amount_2", pos_size / p2_entry)))
+
             # Leg 1
             if pos["side_1"] == "BUY":
-                leg1_pnl = (p1_curr - p1_entry) * (pos_size / p1_entry)
+                leg1_pnl = (p1_curr - p1_entry) * amt1
             else:
-                leg1_pnl = (p1_entry - p1_curr) * (pos_size / p1_entry)
+                leg1_pnl = (p1_entry - p1_curr) * amt1
 
             # Leg 2
             if pos["side_2"] == "BUY":
-                leg2_pnl = (p2_curr - p2_entry) * (pos_size / p2_entry)
+                leg2_pnl = (p2_curr - p2_entry) * amt2
             else:
-                leg2_pnl = (p2_entry - p2_curr) * (pos_size / p2_entry)
+                leg2_pnl = (p2_entry - p2_curr) * amt2
 
-            # Explicit 4-leg Taker fee calculation (Open Leg1 + Open Leg2 + Close Leg1 + Close Leg2)
+            # Explicit 4-leg Taker fee calculation on actual notionals (Open Leg1+2 + Close Leg1+2)
             fee_rate = Decimal(str(getattr(self.config, "taker_fee_rate", Decimal("0.0005"))))
-            est_roundtrip_fees = pos_size * fee_rate * Decimal("4")
+            open_notional = (amt1 * p1_entry) + (amt2 * p2_entry)
+            close_notional = (amt1 * p1_curr) + (amt2 * p2_curr)
+            est_roundtrip_fees = (open_notional + close_notional) * fee_rate
             gross_trading_pnl = leg1_pnl + leg2_pnl
             net_trading_pnl = gross_trading_pnl - est_roundtrip_fees
 
@@ -912,10 +928,10 @@ class BasisStatArbitrage(StrategyV2Base):
             min_hold_s = getattr(self.config, "min_holding_seconds", 60)
             is_min_hold_passed = (duration_s >= min_hold_s)
 
-            # 1. Basis Compression Take-Profit:
+            # 1. Basis Compression Exit (Pure mathematical mean-reversion, no artificial profit masking):
             target_comp = Decimal(str(self.config.take_profit_basis_compression_pct))
             is_basis_compressed = abs(curr_basis) <= target_comp
-            basis_tp_raw = is_basis_compressed and (total_net_pnl > Decimal("0"))
+            basis_tp_raw = is_basis_compressed
 
             # 2. Net Profit Target Take-Profit:
             net_tp_target = self.config.min_take_profit_net_pct
@@ -970,7 +986,10 @@ class BasisStatArbitrage(StrategyV2Base):
                 if stop_loss_condition:
                     reason = f"Emergency Basis Divergence Stop-Loss ({float(net_pnl_pct):.2%} <= -{float(max_loss_pct):.2%})"
                 elif basis_tp_condition:
-                    reason = f"Basis Mean-Reversion TP (Basis compressed to {float(curr_basis):+.2%})"
+                    if total_net_pnl >= 0:
+                        reason = f"Basis Mean-Reversion TP (Basis compressed to {float(curr_basis):+.2%})"
+                    else:
+                        reason = f"Basis Mean-Reversion Exit (Basis compressed to {float(curr_basis):+.2%})"
                 elif net_tp_condition:
                     reason = f"Net PnL Target Take-Profit (+{float(net_pnl_pct):.2%} >= +{float(net_tp_target):.2%})"
                 elif trailing_stop_condition:
@@ -1012,10 +1031,10 @@ class BasisStatArbitrage(StrategyV2Base):
             amt1_val = float(pos.get("amount_1", pos_size_val / p1_entry_val if p1_entry_val > 0 else 0.0))
             amt2_val = float(pos.get("amount_2", pos_size_val / p2_entry_val if p2_entry_val > 0 else 0.0))
             lev_val = float(pos.get("leverage", self.config.leverage))
-            tot_notional_val = float(pos.get("total_notional", pos_size_val * 2.0))
-            margin1_val = float(pos.get("margin_1", pos_size_val / lev_val if lev_val > 0 else pos_size_val))
-            margin2_val = float(pos.get("margin_2", pos_size_val / lev_val if lev_val > 0 else pos_size_val))
-            tot_margin_val = float(pos.get("total_margin", (pos_size_val / lev_val) * 2.0 if lev_val > 0 else pos_size_val * 2.0))
+            tot_notional_val = float(pos.get("total_notional", (amt1_val * p1_entry_val) + (amt2_val * p2_entry_val)))
+            margin1_val = float(pos.get("margin_1", (amt1_val * p1_entry_val) / lev_val if lev_val > 0 else pos_size_val))
+            margin2_val = float(pos.get("margin_2", (amt2_val * p2_entry_val) / lev_val if lev_val > 0 else pos_size_val))
+            tot_margin_val = float(pos.get("total_margin", margin1_val + margin2_val))
 
             record = {
                 "token": token,
