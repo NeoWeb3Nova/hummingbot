@@ -168,6 +168,14 @@ class BasisStatArbitrageConfig(StrategyV2ConfigBase):
             "prompt_on_new": True
         }
     )
+    simulated_latency_slippage_pct: Decimal = Field(
+        default=Decimal("0.0002"),
+        ge=Decimal("0"),
+        json_schema_extra={
+            "prompt": lambda mi: "Simulated latency adverse slippage per leg in dry run (e.g. 0.0002 for 2.0 bps): ",
+            "prompt_on_new": True
+        }
+    )
     settlement_blackout_seconds: int = Field(
         default=60,
         json_schema_extra={
@@ -533,6 +541,91 @@ class BasisStatArbitrage(StrategyV2Base):
         except Exception as e:
             self.logger().error(f"Error handling live funding payment: {e}")
 
+    def get_orderbook_execution_metrics(
+        self,
+        connector_name: str,
+        trading_pair: str,
+        is_buy: bool,
+        quote_volume: Decimal,
+        base_amount: Optional[Decimal] = None
+    ) -> Tuple[Optional[Decimal], Optional[Decimal], Optional[Decimal], Optional[Decimal]]:
+        """
+        Calculates execution metrics directly from live L2 OrderBook:
+        Returns: (best_price, vwap_price, executed_price, depth_slip_pct)
+        - best_price: Top of book (L1 Best Ask if buy, L1 Best Bid if sell)
+        - vwap_price: Volume-weighted average price walking the order book
+        - executed_price: In dry-run mode, applies simulated_latency_slippage_pct; in live mode, returns vwap
+        - depth_slip_pct: abs(vwap - best_price) / best_price
+        """
+        try:
+            connector = self.connectors.get(connector_name)
+            if not connector:
+                return None, None, None, None
+            order_book = connector.get_order_book(trading_pair)
+            if not order_book:
+                return None, None, None, None
+
+            bids_df, asks_df = order_book.snapshot
+            df = asks_df if is_buy else bids_df
+            if df is None or len(df) == 0:
+                return None, None, None, None
+
+            best_p_float = float(df.iloc[0]["price"])
+            if best_p_float <= 0 or math.isnan(best_p_float):
+                return None, None, None, None
+            best_price = Decimal(str(best_p_float))
+
+            cum_quote = Decimal("0")
+            cum_base = Decimal("0")
+
+            if base_amount is not None and base_amount > Decimal("0"):
+                target_base = Decimal(str(base_amount))
+                for idx in range(len(df)):
+                    p = Decimal(str(df.iloc[idx]["price"]))
+                    q = Decimal(str(df.iloc[idx]["amount"]))
+                    if cum_base + q >= target_base:
+                        needed_base = target_base - cum_base
+                        cum_quote += needed_base * p
+                        cum_base = target_base
+                        break
+                    cum_base += q
+                    cum_quote += q * p
+                if cum_base < target_base or cum_base <= Decimal("0"):
+                    return None, None, None, None
+                vwap_price = cum_quote / cum_base
+            else:
+                target_quote = Decimal(str(quote_volume))
+                for idx in range(len(df)):
+                    p = Decimal(str(df.iloc[idx]["price"]))
+                    q = Decimal(str(df.iloc[idx]["amount"]))
+                    cost = p * q
+                    if cum_quote + cost >= target_quote:
+                        needed_quote = target_quote - cum_quote
+                        needed_base = needed_quote / p
+                        cum_base += needed_base
+                        cum_quote = target_quote
+                        break
+                    cum_quote += cost
+                    cum_base += q
+                if cum_quote < target_quote or cum_base <= Decimal("0"):
+                    return None, None, None, None
+                vwap_price = cum_quote / cum_base
+
+            depth_slip_pct = abs(vwap_price - best_price) / best_price if best_price > 0 else Decimal("0")
+
+            latency_slip_pct = Decimal(str(getattr(self.config, "simulated_latency_slippage_pct", Decimal("0.0002"))))
+            if getattr(self.config, "dry_run", True):
+                if is_buy:
+                    executed_price = vwap_price * (Decimal("1") + latency_slip_pct)
+                else:
+                    executed_price = vwap_price * (Decimal("1") - latency_slip_pct)
+            else:
+                executed_price = vwap_price
+
+            return best_price, vwap_price, executed_price, depth_slip_pct
+        except Exception:
+            return None, None, None, None
+
     def get_executable_quote_price(
         self,
         connector_name: str,
@@ -547,6 +640,14 @@ class BasisStatArbitrage(StrategyV2Base):
         Returns None if orderbook depth is insufficient, price is NaN, <= 0, or an error occurs.
         CRITICAL: Never fall back to MidPrice, LastTradePrice, or dummy constant 1.0!
         """
+        best_p, vwap_p, exec_p, _ = self.get_orderbook_execution_metrics(
+            connector_name=connector_name,
+            trading_pair=trading_pair,
+            is_buy=is_buy,
+            quote_volume=quote_volume
+        )
+        if exec_p is not None:
+            return exec_p
         try:
             res = self.market_data_provider.get_price_for_quote_volume(
                 connector_name=connector_name,
@@ -636,24 +737,24 @@ class BasisStatArbitrage(StrategyV2Base):
             m1 = Decimal(str(self.get_token_multiplier(token, c1)))
             m2 = Decimal(str(self.get_token_multiplier(token, c2)))
 
-            # Query real executable orderbook Bid and Ask for pos_size on BOTH exchanges
+            # Query real executable orderbook metrics for pos_size on BOTH exchanges
             # Sell leg hits Bid (is_buy=False); Buy leg hits Ask (is_buy=True)
-            p1_bid = self.get_executable_quote_price(c1, tp1, pos_size, is_buy=False)
-            p1_ask = self.get_executable_quote_price(c1, tp1, pos_size, is_buy=True)
-            p2_bid = self.get_executable_quote_price(c2, tp2, pos_size, is_buy=False)
-            p2_ask = self.get_executable_quote_price(c2, tp2, pos_size, is_buy=True)
+            p1_bid_best, p1_bid_vwap, p1_bid_exec, p1_bid_slip = self.get_orderbook_execution_metrics(c1, tp1, is_buy=False, quote_volume=pos_size)
+            p1_ask_best, p1_ask_vwap, p1_ask_exec, p1_ask_slip = self.get_orderbook_execution_metrics(c1, tp1, is_buy=True, quote_volume=pos_size)
+            p2_bid_best, p2_bid_vwap, p2_bid_exec, p2_bid_slip = self.get_orderbook_execution_metrics(c2, tp2, is_buy=False, quote_volume=pos_size)
+            p2_ask_best, p2_ask_vwap, p2_ask_exec, p2_ask_slip = self.get_orderbook_execution_metrics(c2, tp2, is_buy=True, quote_volume=pos_size)
 
             # Strict Guard: If any order book quote cannot be obtained, skip token completely
             # Zero tolerance for dummy fallback prices like MidPrice, LastTradePrice, or 1.0!
-            if p1_bid is None or p1_ask is None or p2_bid is None or p2_ask is None:
+            if p1_bid_exec is None or p1_ask_exec is None or p2_bid_exec is None or p2_ask_exec is None:
                 self.entry_candidate_ticks[token] = 0
                 continue
 
-            # Normalized executable prices
-            p1_bid_norm = p1_bid / m1
-            p1_ask_norm = p1_ask / m1
-            p2_bid_norm = p2_bid / m2
-            p2_ask_norm = p2_ask / m2
+            # Normalized executable prices (using simulated execution price including order book depth & latency)
+            p1_bid_norm = p1_bid_exec / m1
+            p1_ask_norm = p1_ask_exec / m1
+            p2_bid_norm = p2_bid_exec / m2
+            p2_ask_norm = p2_ask_exec / m2
 
             # Direction A: Sell C1 @ Bid1, Buy C2 @ Ask2 (Overvalued C1, Undervalued C2)
             spread_A = (p1_bid_norm - p2_ask_norm) / p2_ask_norm
@@ -667,16 +768,24 @@ class BasisStatArbitrage(StrategyV2Base):
             if spread_A >= min_entry and spread_A >= spread_B:
                 c1_side = TradeType.SELL
                 c2_side = TradeType.BUY
-                c1_exec_price = p1_bid
-                c2_exec_price = p2_ask
+                c1_best_price = p1_bid_best
+                c1_vwap_price = p1_bid_vwap
+                c1_exec_price = p1_bid_exec
+                c2_best_price = p2_ask_best
+                c2_vwap_price = p2_ask_vwap
+                c2_exec_price = p2_ask_exec
                 c1_norm = p1_bid_norm
                 c2_norm = p2_ask_norm
                 executable_basis_spread = spread_A
             elif spread_B >= min_entry and spread_B > spread_A:
                 c1_side = TradeType.BUY
                 c2_side = TradeType.SELL
-                c1_exec_price = p1_ask
-                c2_exec_price = p2_bid
+                c1_best_price = p1_ask_best
+                c1_vwap_price = p1_ask_vwap
+                c1_exec_price = p1_ask_exec
+                c2_best_price = p2_bid_best
+                c2_vwap_price = p2_bid_vwap
+                c2_exec_price = p2_bid_exec
                 c1_norm = p1_ask_norm
                 c2_norm = p2_bid_norm
                 executable_basis_spread = spread_B
@@ -760,13 +869,29 @@ class BasisStatArbitrage(StrategyV2Base):
             margin_2 = notional_2 / lev_val if lev_val > 0 else notional_2
             tot_margin = margin_1 + margin_2
 
+            # Calculate explicit entry depth & latency slippage costs
+            if c1_side == TradeType.BUY:
+                entry_depth_slip_cost_1 = (c1_vwap_price - c1_best_price) * c1_amount
+                entry_latency_slip_cost_1 = (c1_exec_price - c1_vwap_price) * c1_amount
+            else:
+                entry_depth_slip_cost_1 = (c1_best_price - c1_vwap_price) * c1_amount
+                entry_latency_slip_cost_1 = (c1_vwap_price - c1_exec_price) * c1_amount
+
+            if c2_side == TradeType.BUY:
+                entry_depth_slip_cost_2 = (c2_vwap_price - c2_best_price) * c2_amount
+                entry_latency_slip_cost_2 = (c2_exec_price - c2_vwap_price) * c2_amount
+            else:
+                entry_depth_slip_cost_2 = (c2_best_price - c2_vwap_price) * c2_amount
+                entry_latency_slip_cost_2 = (c2_vwap_price - c2_exec_price) * c2_amount
+
             self.logger().info(
                 f"🚀 [BASIS-ENTRY-TRIGGER] Token '{token}' confirmed executable dislocation: {float(executable_basis_spread):+.3%}!\n"
                 f"  Coin-Neutral Alignment: {float(hedged_amount):,.4f} {token} (Delta-Zero Q1 == Q2)\n"
                 f"  Leg 1 ({c1}): {c1_side.name} {float(c1_amount):,.4f} {token} @ ${float(c1_exec_price):.4f} (货值 ${float(notional_1):,.2f} | 保证金 ${float(margin_1):,.2f})\n"
                 f"  Leg 2 ({c2}): {c2_side.name} {float(c2_amount):,.4f} {token} @ ${float(c2_exec_price):.4f} (货值 ${float(notional_2):,.2f} | 保证金 ${float(margin_2):,.2f})\n"
                 f"  Capital Sizing: 单边货值 ${float(pos_size):,.2f} | 双边总货值 ${float(tot_notional):,.2f} | 实缴总保证金 ${float(tot_margin):,.2f} ({self.config.leverage}x)\n"
-                f"  Indicative Carry: {float(daily_carry):+.2%}/d"
+                f"  Indicative Carry: {float(daily_carry):+.2%}/d\n"
+                f"  Friction Model: Depth Slip: ${float(entry_depth_slip_cost_1 + entry_depth_slip_cost_2):.4f} | Latency Slip: ${float(entry_latency_slip_cost_1 + entry_latency_slip_cost_2):.4f}"
             )
 
             pos_data = {
@@ -778,8 +903,16 @@ class BasisStatArbitrage(StrategyV2Base):
                 "side_2": c2_side.name,
                 "amount_1": float(c1_amount),
                 "amount_2": float(c2_amount),
+                "entry_best_price_1": float(c1_best_price),
+                "entry_best_price_2": float(c2_best_price),
+                "entry_vwap_1": float(c1_vwap_price),
+                "entry_vwap_2": float(c2_vwap_price),
                 "entry_price_1": float(c1_exec_price),
                 "entry_price_2": float(c2_exec_price),
+                "entry_depth_slip_cost_1": float(entry_depth_slip_cost_1),
+                "entry_depth_slip_cost_2": float(entry_depth_slip_cost_2),
+                "entry_latency_slip_cost_1": float(entry_latency_slip_cost_1),
+                "entry_latency_slip_cost_2": float(entry_latency_slip_cost_2),
                 "entry_norm_price_1": float(c1_norm),
                 "entry_norm_price_2": float(c2_norm),
                 "entry_basis_pct": float(executable_basis_spread),
@@ -860,12 +993,32 @@ class BasisStatArbitrage(StrategyV2Base):
             is_buy_close_1 = (pos["side_1"] != "BUY")
             is_buy_close_2 = (pos["side_2"] != "BUY")
 
-            p1_curr = self.get_executable_quote_price(c1, tp1, pos_size, is_buy=is_buy_close_1)
-            p2_curr = self.get_executable_quote_price(c2, tp2, pos_size, is_buy=is_buy_close_2)
+            amt1 = Decimal(str(pos.get("amount_1", pos_size / p1_entry)))
+            amt2 = Decimal(str(pos.get("amount_2", pos_size / p2_entry)))
+
+            p1_close_best, p1_close_vwap, p1_close_exec, p1_close_slip = self.get_orderbook_execution_metrics(
+                c1, tp1, is_buy=is_buy_close_1, quote_volume=pos_size, base_amount=amt1
+            )
+            p2_close_best, p2_close_vwap, p2_close_exec, p2_close_slip = self.get_orderbook_execution_metrics(
+                c2, tp2, is_buy=is_buy_close_2, quote_volume=pos_size, base_amount=amt2
+            )
+
+            # Fallback if metrics returned None
+            if p1_close_exec is None:
+                p1_close_exec = self.get_executable_quote_price(c1, tp1, pos_size, is_buy=is_buy_close_1)
+                p1_close_best = p1_close_exec
+                p1_close_vwap = p1_close_exec
+            if p2_close_exec is None:
+                p2_close_exec = self.get_executable_quote_price(c2, tp2, pos_size, is_buy=is_buy_close_2)
+                p2_close_best = p2_close_exec
+                p2_close_vwap = p2_close_exec
 
             # Strict guard: If either executable quote is unavailable, do NOT evaluate exit at corrupted dummy prices!
-            if p1_curr is None or p2_curr is None:
+            if p1_close_exec is None or p2_close_exec is None:
                 continue
+
+            p1_curr = p1_close_exec
+            p2_curr = p2_close_exec
 
             m1 = Decimal(str(self.get_token_multiplier(token, c1)))
             m2 = Decimal(str(self.get_token_multiplier(token, c2)))
@@ -876,30 +1029,63 @@ class BasisStatArbitrage(StrategyV2Base):
             curr_basis = (p1_curr_norm - p2_curr_norm) / p2_curr_norm
             entry_basis = Decimal(str(pos["entry_basis_pct"]))
 
-            # Trading PnL calculation:
-            # Coin quantities from stored position (strictly aligned Coin-Neutral / Delta-Zero)
-            amt1 = Decimal(str(pos.get("amount_1", pos_size / p1_entry)))
-            amt2 = Decimal(str(pos.get("amount_2", pos_size / p2_entry)))
+            # Exit depth & latency slippage calculations
+            if is_buy_close_1:
+                exit_depth_slip_cost_1 = (p1_close_vwap - p1_close_best) * amt1
+                exit_latency_slip_cost_1 = (p1_close_exec - p1_close_vwap) * amt1
+            else:
+                exit_depth_slip_cost_1 = (p1_close_best - p1_close_vwap) * amt1
+                exit_latency_slip_cost_1 = (p1_close_vwap - p1_close_exec) * amt1
 
-            # Leg 1
+            if is_buy_close_2:
+                exit_depth_slip_cost_2 = (p2_close_vwap - p2_close_best) * amt2
+                exit_latency_slip_cost_2 = (p2_close_exec - p2_close_vwap) * amt2
+            else:
+                exit_depth_slip_cost_2 = (p2_close_best - p2_close_vwap) * amt2
+                exit_latency_slip_cost_2 = (p2_close_vwap - p2_close_exec) * amt2
+
+            tot_depth_slip = (
+                Decimal(str(pos.get("entry_depth_slip_cost_1", 0.0)))
+                + Decimal(str(pos.get("entry_depth_slip_cost_2", 0.0)))
+                + exit_depth_slip_cost_1
+                + exit_depth_slip_cost_2
+            )
+            tot_latency_slip = (
+                Decimal(str(pos.get("entry_latency_slip_cost_1", 0.0)))
+                + Decimal(str(pos.get("entry_latency_slip_cost_2", 0.0)))
+                + exit_latency_slip_cost_1
+                + exit_latency_slip_cost_2
+            )
+
+            # Theoretical Ideal Gross Trading PnL (Zero Slippage, based on L1 Best Prices)
+            p1_entry_best = Decimal(str(pos.get("entry_best_price_1", pos["entry_price_1"])))
+            p2_entry_best = Decimal(str(pos.get("entry_best_price_2", pos["entry_price_2"])))
+
             if pos["side_1"] == "BUY":
+                leg1_ideal_pnl = (p1_close_best - p1_entry_best) * amt1
                 leg1_pnl = (p1_curr - p1_entry) * amt1
             else:
+                leg1_ideal_pnl = (p1_entry_best - p1_close_best) * amt1
                 leg1_pnl = (p1_entry - p1_curr) * amt1
 
-            # Leg 2
             if pos["side_2"] == "BUY":
+                leg2_ideal_pnl = (p2_close_best - p2_entry_best) * amt2
                 leg2_pnl = (p2_curr - p2_entry) * amt2
             else:
+                leg2_ideal_pnl = (p2_entry_best - p2_close_best) * amt2
                 leg2_pnl = (p2_entry - p2_curr) * amt2
+
+            gross_trading_pnl = leg1_ideal_pnl + leg2_ideal_pnl
+            realized_trading_pnl = leg1_pnl + leg2_pnl
 
             # Explicit 4-leg Taker fee calculation on actual notionals (Open Leg1+2 + Close Leg1+2)
             fee_rate = Decimal(str(getattr(self.config, "taker_fee_rate", Decimal("0.0005"))))
             open_notional = (amt1 * p1_entry) + (amt2 * p2_entry)
             close_notional = (amt1 * p1_curr) + (amt2 * p2_curr)
             est_roundtrip_fees = (open_notional + close_notional) * fee_rate
-            gross_trading_pnl = leg1_pnl + leg2_pnl
-            net_trading_pnl = gross_trading_pnl - est_roundtrip_fees
+            total_friction_cost = tot_depth_slip + tot_latency_slip + est_roundtrip_fees
+
+            net_trading_pnl = realized_trading_pnl - est_roundtrip_fees
 
             # Discrete settled funding cashflow (strictly settled at actual exchange settlement windows)
             settled_funding = Decimal(str(pos.get("settled_funding_pnl", 0.0)))
@@ -913,6 +1099,8 @@ class BasisStatArbitrage(StrategyV2Base):
             # Total Net PnL = Net Trading PnL + Actual Settled Funding!
             total_net_pnl = net_trading_pnl + settled_funding
             net_pnl_pct = total_net_pnl / pos_size if pos_size > 0 else Decimal("0")
+
+            alpha_retention_pct = (total_net_pnl / gross_trading_pnl * Decimal("100")) if gross_trading_pnl > Decimal("0") else Decimal("0")
 
             # True ROE on real margin (Dual leg margin = (pos_size / leverage) * 2)
             pos_leverage = Decimal(str(pos.get("leverage", self.config.leverage)))
@@ -1003,7 +1191,10 @@ class BasisStatArbitrage(StrategyV2Base):
                     "token": token,
                     "reason": reason,
                     "gross_trading_pnl": float(gross_trading_pnl),
+                    "depth_slippage_cost": float(tot_depth_slip),
+                    "latency_slippage_cost": float(tot_latency_slip),
                     "trading_fee": float(est_roundtrip_fees),
+                    "total_friction_cost": float(total_friction_cost),
                     "net_trading_pnl": float(net_trading_pnl),
                     "settled_funding_pnl": float(settled_funding),
                     "indicative_accrued_carry": float(indicative_carry),
@@ -1011,8 +1202,11 @@ class BasisStatArbitrage(StrategyV2Base):
                     "total_net_pnl": float(total_net_pnl),
                     "net_pnl_pct": float(net_pnl_pct),
                     "net_roe_pct": float(net_roe_pct),
+                    "alpha_retention_pct": float(alpha_retention_pct),
                     "close_p1": float(p1_curr),
                     "close_p2": float(p2_curr),
+                    "close_best_p1": float(p1_close_best),
+                    "close_best_p2": float(p2_close_best),
                     "close_basis_pct": float(curr_basis),
                     "duration_seconds": int(duration_s),
                 })
@@ -1046,8 +1240,12 @@ class BasisStatArbitrage(StrategyV2Base):
                 "amount_2": amt2_val,
                 "entry_price_1": pos["entry_price_1"],
                 "entry_price_2": pos["entry_price_2"],
+                "entry_best_price_1": pos.get("entry_best_price_1", pos["entry_price_1"]),
+                "entry_best_price_2": pos.get("entry_best_price_2", pos["entry_price_2"]),
                 "close_price_1": item["close_p1"],
                 "close_price_2": item["close_p2"],
+                "close_best_price_1": item.get("close_best_p1", item["close_p1"]),
+                "close_best_price_2": item.get("close_best_p2", item["close_p2"]),
                 "entry_basis_pct": pos["entry_basis_pct"],
                 "close_basis_pct": item["close_basis_pct"],
                 "position_size": pos["position_size"],
@@ -1058,7 +1256,10 @@ class BasisStatArbitrage(StrategyV2Base):
                 "margin_2": margin2_val,
                 "total_margin": tot_margin_val,
                 "gross_trading_pnl": item["gross_trading_pnl"],
+                "depth_slippage_cost": item["depth_slippage_cost"],
+                "latency_slippage_cost": item["latency_slippage_cost"],
                 "trading_fee": item["trading_fee"],
+                "total_friction_cost": item["total_friction_cost"],
                 "net_trading_pnl": item["net_trading_pnl"],
                 "trading_pnl": item["net_trading_pnl"],
                 "funding_pnl": item["settled_funding_pnl"],
@@ -1068,6 +1269,7 @@ class BasisStatArbitrage(StrategyV2Base):
                 "total_net_pnl": item["total_net_pnl"],
                 "net_pnl_pct": item["net_pnl_pct"],
                 "net_roe_pct": item["net_roe_pct"],
+                "alpha_retention_pct": item["alpha_retention_pct"],
                 "close_reason": item["reason"],
                 "open_timestamp": pos["open_timestamp"],
                 "close_timestamp": self.current_timestamp,
@@ -1082,8 +1284,8 @@ class BasisStatArbitrage(StrategyV2Base):
                 f"🎯 [BASIS-POSITION-CLOSED] Token '{token}' ({item['reason']})!\n"
                 f"  Capital Sizing: 单边 ${pos_size_val:,.2f} | 双边 ${tot_notional_val:,.2f} | 实缴保证金 ${tot_margin_val:,.2f} ({lev_val:.0f}x)\n"
                 f"  Quantities: {pos['side_1']} {amt1_val:,.4f} {token} ({pos['connector_1']}) + {pos['side_2']} {amt2_val:,.4f} {token} ({pos['connector_2']})\n"
-                f"  Trading PnL: Gross ${item['gross_trading_pnl']:+.2f} - Fee ${item['trading_fee']:.2f} = Net ${item['net_trading_pnl']:+.2f}\n"
-                f"  Settled Funding: ${item['settled_funding_pnl']:+.2f} ({unique_windows} windows), Total Net: ${item['total_net_pnl']:+.2f} (ROE {item['net_roe_pct']:+.2%}), Held: {item['duration_seconds']}s"
+                f"  Friction Audit: Gross ${item['gross_trading_pnl']:+.2f} - DepthSlip ${item['depth_slippage_cost']:.2f} - LatencySlip ${item['latency_slippage_cost']:.2f} - Fee ${item['trading_fee']:.2f} = NetTrade ${item['net_trading_pnl']:+.2f}\n"
+                f"  Settled Funding: ${item['settled_funding_pnl']:+.2f} ({unique_windows} windows), Total Net: ${item['total_net_pnl']:+.2f} (ROE {item['net_roe_pct']:+.2%}, Alpha Retention: {item['alpha_retention_pct']:.1f}%), Held: {item['duration_seconds']}s"
             )
 
             # If real trading, stop executors
@@ -1114,6 +1316,12 @@ class BasisStatArbitrage(StrategyV2Base):
                 "close_basis_pct": pos["entry_basis_pct"],
                 "position_size": pos["position_size"],
                 "leverage": pos["leverage"],
+                "gross_trading_pnl": 0.0,
+                "depth_slippage_cost": 0.0,
+                "latency_slippage_cost": 0.0,
+                "trading_fee": 0.0,
+                "total_friction_cost": 0.0,
+                "net_trading_pnl": 0.0,
                 "trading_pnl": 0.0,
                 "funding_pnl": settled,
                 "indicative_accrued_carry": 0.0,
@@ -1121,6 +1329,7 @@ class BasisStatArbitrage(StrategyV2Base):
                 "funding_payments": pos.get("funding_payments", []),
                 "total_net_pnl": settled,
                 "net_pnl_pct": settled / pos["position_size"] if pos.get("position_size") else 0.0,
+                "alpha_retention_pct": 0.0,
                 "close_reason": reason,
                 "open_timestamp": pos["open_timestamp"],
                 "close_timestamp": self.current_timestamp,
