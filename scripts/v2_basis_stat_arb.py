@@ -400,9 +400,15 @@ class BasisStatArbitrage(StrategyV2Base):
                             item["total_friction_cost"] = round(fee + float(item["depth_slippage_cost"]) + float(item["latency_slippage_cost"]), 4)
                         gross = float(item.get("gross_trading_pnl", float(item.get("trading_pnl", 0.0)) + float(item["total_friction_cost"])))
                         item["gross_trading_pnl"] = round(gross, 4)
-                        net = float(item.get("total_net_pnl", 0.0))
+                        funding = float(item.get("funding_pnl", 0.0))
+                        real_net = round(gross - float(item["total_friction_cost"]) + funding, 4)
+                        item["net_trading_pnl"] = round(gross - float(item["total_friction_cost"]), 4)
+                        item["trading_pnl"] = item["net_trading_pnl"]
+                        item["total_net_pnl"] = real_net
+                        item["paper_trading_pnl"] = round(gross - fee, 4)
+                        item["paper_net_pnl"] = round(gross - fee + funding, 4)
                         if "alpha_retention_pct" not in item or item["alpha_retention_pct"] is None:
-                            item["alpha_retention_pct"] = round(net / gross * 100.0, 2) if gross > 0 else 0.0
+                            item["alpha_retention_pct"] = round(real_net / gross * 100.0, 2) if gross > 0 else 0.0
 
                         if tok not in self.stopped_basis_arbitrages:
                             self.stopped_basis_arbitrages[tok] = []
@@ -1101,7 +1107,9 @@ class BasisStatArbitrage(StrategyV2Base):
             est_roundtrip_fees = (open_notional + close_notional) * fee_rate
             total_friction_cost = tot_depth_slip + tot_latency_slip + est_roundtrip_fees
 
-            net_trading_pnl = realized_trading_pnl - est_roundtrip_fees
+            # Real Penetrated Net Trading PnL = Gross - Total Friction (Fees + Depth Slippage + Latency Slippage)
+            net_trading_pnl = gross_trading_pnl - total_friction_cost
+            paper_trading_pnl = gross_trading_pnl - est_roundtrip_fees
 
             # Discrete settled funding cashflow (strictly settled at actual exchange settlement windows)
             settled_funding = Decimal(str(pos.get("settled_funding_pnl", 0.0)))
@@ -1112,8 +1120,9 @@ class BasisStatArbitrage(StrategyV2Base):
             daily_carry = Decimal(str(pos.get("expected_daily_carry", 0.0)))
             indicative_carry = pos_size * daily_carry * Decimal(str(duration_s / 86400.0))
 
-            # Total Net PnL = Net Trading PnL + Actual Settled Funding!
+            # Total Net PnL = Real Net Trading PnL + Actual Settled Funding
             total_net_pnl = net_trading_pnl + settled_funding
+            paper_net_pnl = paper_trading_pnl + settled_funding
             net_pnl_pct = total_net_pnl / pos_size if pos_size > 0 else Decimal("0")
 
             alpha_retention_pct = (total_net_pnl / gross_trading_pnl * Decimal("100")) if gross_trading_pnl > Decimal("0") else Decimal("0")
@@ -1231,10 +1240,12 @@ class BasisStatArbitrage(StrategyV2Base):
                     "trading_fee": float(est_roundtrip_fees),
                     "total_friction_cost": float(total_friction_cost),
                     "net_trading_pnl": float(net_trading_pnl),
+                    "paper_trading_pnl": float(paper_trading_pnl),
                     "settled_funding_pnl": float(settled_funding),
                     "indicative_accrued_carry": float(indicative_carry),
                     "funding_income": float(settled_funding),
                     "total_net_pnl": float(total_net_pnl),
+                    "paper_net_pnl": float(paper_net_pnl),
                     "net_pnl_pct": float(net_pnl_pct),
                     "net_roe_pct": float(net_roe_pct),
                     "alpha_retention_pct": float(alpha_retention_pct),
@@ -1296,12 +1307,14 @@ class BasisStatArbitrage(StrategyV2Base):
                 "trading_fee": item["trading_fee"],
                 "total_friction_cost": item["total_friction_cost"],
                 "net_trading_pnl": item["net_trading_pnl"],
+                "paper_trading_pnl": item.get("paper_trading_pnl", item["gross_trading_pnl"] - item["trading_fee"]),
                 "trading_pnl": item["net_trading_pnl"],
                 "funding_pnl": item["settled_funding_pnl"],
                 "indicative_accrued_carry": item["indicative_accrued_carry"],
                 "settlement_count": unique_windows,
                 "funding_payments": pos.get("funding_payments", []),
                 "total_net_pnl": item["total_net_pnl"],
+                "paper_net_pnl": item.get("paper_net_pnl", item["gross_trading_pnl"] - item["trading_fee"] + item["settled_funding_pnl"]),
                 "net_pnl_pct": item["net_pnl_pct"],
                 "net_roe_pct": item["net_roe_pct"],
                 "alpha_retention_pct": item["alpha_retention_pct"],
