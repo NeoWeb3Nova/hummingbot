@@ -543,6 +543,7 @@ class BasisStatArbitrage(StrategyV2Base):
                     self.logger().warning(f"Could not load state from {path}: {e}")
 
     def on_tick(self):
+        t0 = time.perf_counter()
         if self.ready_to_trade and self.market_data_provider.ready:
             self.check_strategy_commands()
             self.check_funding_settlement()
@@ -551,6 +552,9 @@ class BasisStatArbitrage(StrategyV2Base):
             for action in actions:
                 self.executor_orchestrator.execute_action(action)
             self.publish_basis_arbitrage_performance()
+
+            duration_ms = (time.perf_counter() - t0) * 1000.0
+            self._last_tick_latency_ms = duration_ms
 
             # Periodic scan logging (every 30s)
             now = self.current_timestamp
@@ -561,9 +565,11 @@ class BasisStatArbitrage(StrategyV2Base):
                 comp = getattr(self, "_latest_market_comparison", [])
                 spread_strs = [f"{m['token']}: {m['basis_spread_pct']:+.2%}" for m in comp[:6]]
                 thresh = float(self.config.min_entry_basis_pct)
+                headroom = max(0.0, 100.0 - (duration_ms / 1000.0 * 100.0))
                 self.logger().info(
                     f"⚡ [BASIS-SCAN] Monitoring {len(self.config.tokens)} liquid pairs (Threshold: ±{thresh:.2%}). "
-                    f"Top spreads: [{', '.join(spread_strs)}]. Active Positions: {len(self.active_basis_arbitrages)}"
+                    f"Top spreads: [{', '.join(spread_strs)}]. Active: {len(self.active_basis_arbitrages)}. "
+                    f"Tick Latency: {duration_ms:.1f}ms (Headroom: {headroom:.1f}%)"
                 )
 
     def check_strategy_commands(self):
@@ -697,13 +703,32 @@ class BasisStatArbitrage(StrategyV2Base):
             if not order_book:
                 return Decimal("0"), Decimal("0")
 
+            top1_depth = Decimal("0")
+            top_n_depth = Decimal("0")
+
+            # High-performance zero-copy iterator path
+            if hasattr(order_book, "ask_entries") and hasattr(order_book, "bid_entries"):
+                entries = order_book.ask_entries() if is_buy else order_book.bid_entries()
+                for idx, entry in enumerate(entries):
+                    if idx >= top_n:
+                        break
+                    p_val = entry.price
+                    q_val = entry.amount
+                    if p_val <= 0 or q_val <= 0 or math.isnan(p_val) or math.isnan(q_val):
+                        continue
+                    p = Decimal(str(p_val))
+                    q = Decimal(str(q_val))
+                    cost = p * q
+                    if idx == 0:
+                        top1_depth = cost
+                    top_n_depth += cost
+                return top1_depth, top_n_depth
+
+            # Fallback path for mocks
             bids_df, asks_df = order_book.snapshot
             df = asks_df if is_buy else bids_df
             if df is None or len(df) == 0:
                 return Decimal("0"), Decimal("0")
-
-            top1_depth = Decimal("0")
-            top_n_depth = Decimal("0")
 
             n_rows = min(top_n, len(df))
             for idx in range(n_rows):
@@ -746,51 +771,111 @@ class BasisStatArbitrage(StrategyV2Base):
             if not order_book:
                 return None, None, None, None
 
-            bids_df, asks_df = order_book.snapshot
-            df = asks_df if is_buy else bids_df
-            if df is None or len(df) == 0:
-                return None, None, None, None
+            best_price = None
+            vwap_price = None
 
-            best_p_float = float(df.iloc[0]["price"])
-            if best_p_float <= 0 or math.isnan(best_p_float):
-                return None, None, None, None
-            best_price = Decimal(str(best_p_float))
+            # High-performance zero-copy iterator path
+            if hasattr(order_book, "ask_entries") and hasattr(order_book, "bid_entries"):
+                entries = order_book.ask_entries() if is_buy else order_book.bid_entries()
+                cum_quote = Decimal("0")
+                cum_base = Decimal("0")
 
-            cum_quote = Decimal("0")
-            cum_base = Decimal("0")
+                if base_amount is not None and base_amount > Decimal("0"):
+                    target_base = Decimal(str(base_amount))
+                    for idx, entry in enumerate(entries):
+                        p_val = entry.price
+                        q_val = entry.amount
+                        if p_val <= 0 or q_val <= 0 or math.isnan(p_val) or math.isnan(q_val):
+                            continue
+                        p = Decimal(str(p_val))
+                        q = Decimal(str(q_val))
+                        if best_price is None:
+                            best_price = p
 
-            if base_amount is not None and base_amount > Decimal("0"):
-                target_base = Decimal(str(base_amount))
-                for idx in range(len(df)):
-                    p = Decimal(str(df.iloc[idx]["price"]))
-                    q = Decimal(str(df.iloc[idx]["amount"]))
-                    if cum_base + q >= target_base:
-                        needed_base = target_base - cum_base
-                        cum_quote += needed_base * p
-                        cum_base = target_base
-                        break
-                    cum_base += q
-                    cum_quote += q * p
-                if cum_base < target_base or cum_base <= Decimal("0"):
-                    return None, None, None, None
-                vwap_price = cum_quote / cum_base
+                        if cum_base + q >= target_base:
+                            needed_base = target_base - cum_base
+                            cum_quote += needed_base * p
+                            cum_base = target_base
+                            break
+                        cum_base += q
+                        cum_quote += q * p
+
+                    if best_price is None or cum_base < target_base or cum_base <= Decimal("0"):
+                        return None, None, None, None
+                    vwap_price = cum_quote / cum_base
+                else:
+                    target_quote = Decimal(str(quote_volume))
+                    for idx, entry in enumerate(entries):
+                        p_val = entry.price
+                        q_val = entry.amount
+                        if p_val <= 0 or q_val <= 0 or math.isnan(p_val) or math.isnan(q_val):
+                            continue
+                        p = Decimal(str(p_val))
+                        q = Decimal(str(q_val))
+                        if best_price is None:
+                            best_price = p
+
+                        cost = p * q
+                        if cum_quote + cost >= target_quote:
+                            needed_quote = target_quote - cum_quote
+                            needed_base = needed_quote / p
+                            cum_base += needed_base
+                            cum_quote = target_quote
+                            break
+                        cum_quote += cost
+                        cum_base += q
+
+                    if best_price is None or cum_quote < target_quote or cum_base <= Decimal("0"):
+                        return None, None, None, None
+                    vwap_price = cum_quote / cum_base
+
             else:
-                target_quote = Decimal(str(quote_volume))
-                for idx in range(len(df)):
-                    p = Decimal(str(df.iloc[idx]["price"]))
-                    q = Decimal(str(df.iloc[idx]["amount"]))
-                    cost = p * q
-                    if cum_quote + cost >= target_quote:
-                        needed_quote = target_quote - cum_quote
-                        needed_base = needed_quote / p
-                        cum_base += needed_base
-                        cum_quote = target_quote
-                        break
-                    cum_quote += cost
-                    cum_base += q
-                if cum_quote < target_quote or cum_base <= Decimal("0"):
+                # Fallback path for mocks
+                bids_df, asks_df = order_book.snapshot
+                df = asks_df if is_buy else bids_df
+                if df is None or len(df) == 0:
                     return None, None, None, None
-                vwap_price = cum_quote / cum_base
+
+                best_p_float = float(df.iloc[0]["price"])
+                if best_p_float <= 0 or math.isnan(best_p_float):
+                    return None, None, None, None
+                best_price = Decimal(str(best_p_float))
+
+                cum_quote = Decimal("0")
+                cum_base = Decimal("0")
+
+                if base_amount is not None and base_amount > Decimal("0"):
+                    target_base = Decimal(str(base_amount))
+                    for idx in range(len(df)):
+                        p = Decimal(str(df.iloc[idx]["price"]))
+                        q = Decimal(str(df.iloc[idx]["amount"]))
+                        if cum_base + q >= target_base:
+                            needed_base = target_base - cum_base
+                            cum_quote += needed_base * p
+                            cum_base = target_base
+                            break
+                        cum_base += q
+                        cum_quote += q * p
+                    if cum_base < target_base or cum_base <= Decimal("0"):
+                        return None, None, None, None
+                    vwap_price = cum_quote / cum_base
+                else:
+                    target_quote = Decimal(str(quote_volume))
+                    for idx in range(len(df)):
+                        p = Decimal(str(df.iloc[idx]["price"]))
+                        q = Decimal(str(df.iloc[idx]["amount"]))
+                        cost = p * q
+                        if cum_quote + cost >= target_quote:
+                            needed_quote = target_quote - cum_quote
+                            needed_base = needed_quote / p
+                            cum_base += needed_base
+                            cum_quote = target_quote
+                            break
+                        cum_quote += cost
+                        cum_base += q
+                    if cum_quote < target_quote or cum_base <= Decimal("0"):
+                        return None, None, None, None
+                    vwap_price = cum_quote / cum_base
 
             depth_slip_pct = abs(vwap_price - best_price) / best_price if best_price > 0 else Decimal("0")
 
@@ -1653,6 +1738,7 @@ class BasisStatArbitrage(StrategyV2Base):
             "rotation_history": getattr(self, "rotation_history", []),
             "token_admitted_at": getattr(self, "token_admitted_at", {}),
             "active_universe_tokens": list(self.config.tokens),
+            "tick_latency_ms": round(getattr(self, "_last_tick_latency_ms", 0.0), 1),
             "auto_rotation_enabled": getattr(self.config, "auto_rotation_enabled", True),
             "auto_rotation_interval_minutes": getattr(self.config, "auto_rotation_interval_minutes", 3.0),
         }
@@ -1931,6 +2017,8 @@ class BasisStatArbitrage(StrategyV2Base):
         all_closed = sum(len(l) for l in self.stopped_basis_arbitrages.values())
         lines.append(f"  Closed Trades: {all_closed}")
         lines.append(f"  Dynamic Rotation: {'Enabled' if getattr(self.config, 'auto_rotation_enabled', True) else 'Disabled'} | Interval: {getattr(self.config, 'auto_rotation_interval_minutes', 3.0):.1f}m | Swaps: {len(getattr(self, 'rotation_history', []))}")
+        latency = getattr(self, "_last_tick_latency_ms", 0.0)
+        lines.append(f"  Tick Engine: 1.0s Loop | Latency: {latency:.1f}ms | Headroom: {max(0.0, 100.0 - latency / 10.0):.1f}%")
         return "\n".join(lines)
 
     # =========================================================================
