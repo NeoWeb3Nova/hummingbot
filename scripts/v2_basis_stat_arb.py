@@ -16,6 +16,7 @@ from hummingbot.connector.connector_base import ConnectorBase
 from hummingbot.core.clock import Clock
 from hummingbot.core.data_type.common import MarketDict, OrderType, PositionAction, PositionMode, PriceType, TradeType
 from hummingbot.core.event.events import FundingPaymentCompletedEvent
+from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.strategy.strategy_v2_base import StrategyV2Base, StrategyV2ConfigBase
 from hummingbot.strategy_v2.executors.position_executor.data_types import PositionExecutorConfig, TripleBarrierConfig
 from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, StopExecutorAction
@@ -212,6 +213,60 @@ class BasisStatArbitrageConfig(StrategyV2ConfigBase):
             "prompt_on_new": True
         }
     )
+    auto_rotation_enabled: bool = Field(
+        default=True,
+        json_schema_extra={
+            "prompt": lambda mi: "Enable background universe scanner and dynamic token rotation? (True/False): ",
+            "prompt_on_new": False,
+        }
+    )
+    auto_rotation_interval_minutes: float = Field(
+        default=3.0,
+        ge=0.5,
+        json_schema_extra={
+            "prompt": lambda mi: "Interval in minutes between full-market background scans (e.g. 3.0): ",
+            "prompt_on_new": False,
+        }
+    )
+    auto_rotation_min_entry_basis_pct: Decimal = Field(
+        default=Decimal("0.0070"),
+        json_schema_extra={
+            "prompt": lambda mi: "Min indicative basis for candidate token to qualify for admission (e.g. 0.0070 for 0.70%): ",
+            "prompt_on_new": False,
+        }
+    )
+    auto_rotation_min_delta_edge_pct: Decimal = Field(
+        default=Decimal("0.0030"),
+        json_schema_extra={
+            "prompt": lambda mi: "Min edge advantage over evicted token required to execute swap (e.g. 0.0030 for 30 bps): ",
+            "prompt_on_new": False,
+        }
+    )
+    auto_rotation_min_dwell_minutes: float = Field(
+        default=30.0,
+        ge=5.0,
+        json_schema_extra={
+            "prompt": lambda mi: "Min dwell time in minutes an idle token must stay before eviction (e.g. 30.0): ",
+            "prompt_on_new": False,
+        }
+    )
+    auto_rotation_min_volume_24h_usd: Decimal = Field(
+        default=Decimal("2000000.0"),
+        ge=Decimal("0"),
+        json_schema_extra={
+            "prompt": lambda mi: "Min 24h volume USD to qualify for admission (e.g. 2000000.0): ",
+            "prompt_on_new": False,
+        }
+    )
+    auto_rotation_max_swaps_per_cycle: int = Field(
+        default=2,
+        ge=1,
+        le=5,
+        json_schema_extra={
+            "prompt": lambda mi: "Max number of token pairs swapped in a single cycle (e.g. 2): ",
+            "prompt_on_new": False,
+        }
+    )
 
     @field_validator("tokens", mode="before")
     def validate_tokens(cls, v):
@@ -379,6 +434,14 @@ class BasisStatArbitrage(StrategyV2Base):
         self.divergence_tick_counter: Dict[str, int] = {}
         self.token_last_closed_timestamp: Dict[str, float] = {}
 
+        # Two-Tier Dynamic Universe Rotation & Hot-Swap Engine
+        self.market_discovery_candidates: List[Dict] = []
+        self.rotation_history: List[Dict] = []
+        self._universe_mutation_lock = asyncio.Lock()
+        self._rotation_in_progress = False
+        self._last_rotation_check_ts = 0.0
+        self.token_admitted_at: Dict[str, float] = {tok: time.time() for tok in self.config.tokens}
+
         # Set leverage and position mode for real trading
         if not self.config.dry_run:
             for connector_name, connector in connectors.items():
@@ -454,6 +517,26 @@ class BasisStatArbitrage(StrategyV2Base):
                             if "next_funding_time_2" not in pos:
                                 pos["next_funding_time_2"] = int(now_ts + 3600)
                             self.active_basis_arbitrages[tok] = pos
+
+                    # Load universe discovery candidates and rotation history
+                    self.market_discovery_candidates = data.get("market_discovery_candidates", [])
+                    self.rotation_history = data.get("rotation_history", [])
+                    persisted_admitted = data.get("token_admitted_at", {})
+                    for tok in self.config.tokens:
+                        if tok in persisted_admitted:
+                            self.token_admitted_at[tok] = float(persisted_admitted[tok])
+                        else:
+                            self.token_admitted_at[tok] = now_ts
+
+                    # Restore dynamically adapted universe tokens if present
+                    persisted_universe = data.get("active_universe_tokens")
+                    if persisted_universe and isinstance(persisted_universe, (list, set)) and len(persisted_universe) >= 10:
+                        if isinstance(self.config.tokens, list):
+                            self.config.tokens = list(persisted_universe)
+                        elif isinstance(self.config.tokens, set):
+                            self.config.tokens = set(persisted_universe)
+                        self.logger().info(f"[BASIS-STAT-ARB] Restored dynamically adapted universe of {len(self.config.tokens)} tokens.")
+
                     self.logger().info(f"[BASIS-STAT-ARB] Loaded {len(closed_list)} closed trades & {len(self.active_basis_arbitrages)} active positions from {path}")
                     break
                 except Exception as e:
@@ -463,6 +546,7 @@ class BasisStatArbitrage(StrategyV2Base):
         if self.ready_to_trade and self.market_data_provider.ready:
             self.check_strategy_commands()
             self.check_funding_settlement()
+            self.check_universe_rotation()
             actions = self.determine_executor_actions()
             for action in actions:
                 self.executor_orchestrator.execute_action(action)
@@ -1565,6 +1649,12 @@ class BasisStatArbitrage(StrategyV2Base):
             "active_positions": list(self.active_basis_arbitrages.values()),
             "closed_trades": all_closed,
             "market_comparison": getattr(self, "_latest_market_comparison", []),
+            "market_discovery_candidates": getattr(self, "market_discovery_candidates", []),
+            "rotation_history": getattr(self, "rotation_history", []),
+            "token_admitted_at": getattr(self, "token_admitted_at", {}),
+            "active_universe_tokens": list(self.config.tokens),
+            "auto_rotation_enabled": getattr(self.config, "auto_rotation_enabled", True),
+            "auto_rotation_interval_minutes": getattr(self.config, "auto_rotation_interval_minutes", 3.0),
         }
 
         for path in self.data_file_candidates:
@@ -1840,4 +1930,345 @@ class BasisStatArbitrage(StrategyV2Base):
             )
         all_closed = sum(len(l) for l in self.stopped_basis_arbitrages.values())
         lines.append(f"  Closed Trades: {all_closed}")
+        lines.append(f"  Dynamic Rotation: {'Enabled' if getattr(self.config, 'auto_rotation_enabled', True) else 'Disabled'} | Interval: {getattr(self.config, 'auto_rotation_interval_minutes', 3.0):.1f}m | Swaps: {len(getattr(self, 'rotation_history', []))}")
         return "\n".join(lines)
+
+    # =========================================================================
+    # Two-Tier Dynamic Universe Rotation & Hot-Swap Engine
+    # =========================================================================
+
+    def check_universe_rotation(self):
+        """Schedule periodic full-market background scan and dynamic hot-swap."""
+        if not getattr(self.config, "auto_rotation_enabled", True):
+            return
+        now = self.current_timestamp
+        interval_sec = getattr(self.config, "auto_rotation_interval_minutes", 3.0) * 60.0
+        if now - getattr(self, "_last_rotation_check_ts", 0.0) >= interval_sec and not getattr(self, "_rotation_in_progress", False):
+            self._last_rotation_check_ts = now
+            safe_ensure_future(self._async_check_and_rotate_universe())
+
+    async def _async_check_and_rotate_universe(self):
+        """Full market candidate discovery and dynamic hot-swapping execution."""
+        if getattr(self, "_rotation_in_progress", False):
+            return
+        self._rotation_in_progress = True
+        try:
+            candidates = await asyncio.to_thread(self._fetch_full_market_universe_candidates_sync)
+            if candidates:
+                self.market_discovery_candidates = candidates
+                await self._evaluate_and_execute_hot_swaps(candidates)
+                self._persist_state()
+        except Exception as e:
+            self.logger().warning(f"Error in dynamic universe rotation check: {e}")
+        finally:
+            self._rotation_in_progress = False
+
+    def _fetch_full_market_universe_candidates_sync(self) -> List[Dict]:
+        """
+        Lightweight full-market REST discovery (Tier 1).
+        Scans all perpetual pairs between Binance and Hyperliquid (~185 tokens).
+        Calculates indicative basis dislocation, 24h quote volumes, and mark prices.
+        """
+        import socket
+        orig_getaddrinfo = socket.getaddrinfo
+        def getaddrinfo_ipv4(host, port, family=0, type=0, proto=0, flags=0):
+            return orig_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
+
+        try:
+            # Force IPv4 preference for container compatibility
+            socket.getaddrinfo = getaddrinfo_ipv4
+
+            # 1. Hyperliquid perpetuals
+            hl_req = urllib.request.Request(
+                "https://api.hyperliquid.xyz/info",
+                data=json.dumps({"type": "metaAndAssetCtxs"}).encode("utf-8"),
+                headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"}
+            )
+            with urllib.request.urlopen(hl_req, timeout=20) as resp:
+                hl_raw = json.loads(resp.read().decode("utf-8"))
+
+            hl_assets = {}
+            for i, asset_meta in enumerate(hl_raw[0].get("universe", [])):
+                name = asset_meta.get("name")
+                if i < len(hl_raw[1]):
+                    ctx = hl_raw[1][i]
+                    mid = float(ctx.get("midPx") or ctx.get("markPx") or 0.0)
+                    vol = float(ctx.get("dayNtlVlm") or 0.0)
+                    funding = float(ctx.get("funding") or 0.0)
+                    hl_assets[name] = {"price": mid, "volume_24h": vol, "funding_rate": funding}
+
+            # 2. Binance perpetuals 24hr tickers
+            bn_req = urllib.request.Request(
+                "https://fapi.binance.com/fapi/v1/ticker/24hr",
+                headers={"User-Agent": "Mozilla/5.0"}
+            )
+            with urllib.request.urlopen(bn_req, timeout=20) as resp:
+                bn_raw = json.loads(resp.read().decode("utf-8"))
+
+            bn_assets = {}
+            for item in bn_raw:
+                sym = item.get("symbol", "")
+                if sym.endswith("USDT"):
+                    base = sym[:-4]
+                    bn_assets[base] = {
+                        "price": float(item.get("lastPrice") or 0.0),
+                        "volume_24h": float(item.get("quoteVolume") or 0.0),
+                        "symbol": sym
+                    }
+
+            canonical_reverse = {
+                "1000PEPE": "PEPE", "1000FLOKI": "FLOKI", "1000BONK": "BONK",
+                "1000SHIB": "SHIB", "kSHIB": "SHIB", "1000SATS": "SATS", "kSATS": "SATS",
+                "1000LUNC": "LUNC", "1000XEC": "XEC", "1000RATS": "RATS"
+            }
+
+            active_tokens_set = set(self.config.tokens)
+            candidates = []
+
+            for hl_name, hl_data in hl_assets.items():
+                norm_hl = canonical_reverse.get(hl_name, hl_name)
+                bn_match = None
+                if norm_hl in bn_assets:
+                    bn_match = norm_hl
+                elif f"1000{norm_hl}" in bn_assets:
+                    bn_match = f"1000{norm_hl}"
+
+                if bn_match:
+                    bn_data = bn_assets[bn_match]
+                    hl_px = hl_data["price"]
+                    bn_px = bn_data["price"]
+                    if bn_match.startswith("1000") and not hl_name.startswith(("1000", "k")):
+                        bn_px = bn_px / 1000.0
+                    elif hl_name.startswith(("1000", "k")) and not bn_match.startswith("1000"):
+                        hl_px = hl_px / 1000.0
+
+                    if bn_px > 0 and hl_px > 0:
+                        basis_pct = (hl_px - bn_px) / bn_px
+                        hl_vol = hl_data["volume_24h"]
+                        bn_vol = bn_data["volume_24h"]
+                        min_vol = min(hl_vol, bn_vol)
+                        is_active = norm_hl in active_tokens_set
+
+                        candidates.append({
+                            "token": norm_hl,
+                            "hl_symbol": hl_name,
+                            "bn_symbol": bn_match,
+                            "hl_price": hl_px,
+                            "bn_price": bn_px,
+                            "basis_pct": round(basis_pct, 6),
+                            "basis_spread_pct": round(basis_pct, 6),
+                            "hl_volume_24h": round(hl_vol, 2),
+                            "bn_volume_24h": round(bn_vol, 2),
+                            "min_volume_24h": round(min_vol, 2),
+                            "hl_funding_rate": hl_data.get("funding_rate", 0.0),
+                            "is_active": is_active,
+                            "status": "ACTIVE" if is_active else "STANDBY",
+                            "dwell_seconds": int(time.time() - self.token_admitted_at.get(norm_hl, time.time())) if is_active else 0,
+                            "scanned_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                        })
+
+            candidates.sort(key=lambda x: abs(x["basis_pct"]), reverse=True)
+            standby_dislocated = [c["token"] + ": " + f"{c['basis_pct']:+.2%}" for c in candidates if not c["is_active"]][:5]
+            self.logger().info(
+                f"🔭 [UNIVERSE-SCAN] Scanned {len(candidates)} shared perpetual pairs across Hyperliquid & Binance. "
+                f"Top Standby: {standby_dislocated}"
+            )
+            return candidates
+
+        except Exception as e:
+            self.logger().warning(f"Failed to fetch market candidates via REST: {e}")
+            return []
+        finally:
+            socket.getaddrinfo = orig_getaddrinfo
+
+    async def _evaluate_and_execute_hot_swaps(self, candidates: List[Dict]):
+        """
+        Evaluate candidate tokens vs current active universe tokens (Tier 2).
+        Evicts dormant 'zombie' tokens with low basis & no active positions,
+        replacing them with high-dislocation liquid candidates.
+        """
+        if not getattr(self.config, "auto_rotation_enabled", True):
+            return
+
+        min_entry_basis = float(getattr(self.config, "auto_rotation_min_entry_basis_pct", Decimal("0.0070")))
+        min_vol_bn = float(getattr(self.config, "auto_rotation_min_volume_24h_usd", Decimal("2000000.0")))
+        min_vol_hl = 500000.0
+        min_delta_edge = float(getattr(self.config, "auto_rotation_min_delta_edge_pct", Decimal("0.0030")))
+        min_dwell_sec = float(getattr(self.config, "auto_rotation_min_dwell_minutes", 30.0)) * 60.0
+        max_swaps = int(getattr(self.config, "auto_rotation_max_swaps_per_cycle", 2))
+
+        # 1. Filter standby candidates qualifying for entry
+        qualifying_candidates = [
+            c for c in candidates
+            if not c["is_active"]
+            and abs(c["basis_pct"]) >= min_entry_basis
+            and c["bn_volume_24h"] >= min_vol_bn
+            and c["hl_volume_24h"] >= min_vol_hl
+        ]
+
+        if not qualifying_candidates:
+            return
+
+        # 2. Identify active zombie tokens eligible for eviction
+        now = time.time()
+        active_spread_map = {c["token"]: abs(c["basis_pct"]) for c in candidates if c["is_active"]}
+
+        eligible_victims = []
+        for tok in list(self.config.tokens):
+            # Hard Rule 1: Active positions have absolute immunity
+            if tok in self.active_basis_arbitrages:
+                continue
+
+            # Hard Rule 2: Minimum dwell time barrier (avoid flapping)
+            admit_ts = self.token_admitted_at.get(tok, now)
+            dwell_s = now - admit_ts
+            if dwell_s < min_dwell_sec:
+                continue
+
+            spread = active_spread_map.get(tok, 0.0)
+            eligible_victims.append({
+                "token": tok,
+                "spread": spread,
+                "dwell_s": dwell_s
+            })
+
+        # Sort eligible victims by spread ascending (coldest first)
+        eligible_victims.sort(key=lambda x: x["spread"])
+
+        if not eligible_victims:
+            self.logger().info(
+                f"[UNIVERSE-HOT-SWAP] Found {len(qualifying_candidates)} qualified candidates, but all active tokens are protected (in position or dwell < {min_dwell_sec/60:.0f}m)."
+            )
+            return
+
+        # 3. Execute pairwise hot-swaps
+        swaps_done = 0
+        for cand in qualifying_candidates:
+            if swaps_done >= max_swaps or not eligible_victims:
+                break
+
+            victim = eligible_victims.pop(0)
+            delta_edge = abs(cand["basis_pct"]) - victim["spread"]
+
+            # Hard Rule 3: Delta edge advantage requirement
+            if delta_edge < min_delta_edge:
+                self.logger().info(
+                    f"[UNIVERSE-HOT-SWAP] Standby {cand['token']} spread {abs(cand['basis_pct']):.2%} delta edge over victim {victim['token']} {victim['spread']:.2%} is {delta_edge:.2%} < threshold {min_delta_edge:.2%}. Skipping."
+                )
+                continue
+
+            reason = (
+                f"Dynamic Hot-Swap: Candidate {cand['token']} (|ΔP|={abs(cand['basis_pct']):.2%}, Vol=${cand['min_volume_24h']/1e6:.1f}M) "
+                f"replaces idle {victim['token']} (|ΔP|={victim['spread']:.2%}, Dwell={victim['dwell_s']/60:.1f}m, Δ={delta_edge:+.2%})"
+            )
+            await self._async_hot_swap_token(
+                evict_tok=victim["token"],
+                admit_tok=cand["token"],
+                reason=reason,
+                evicted_basis=victim["spread"],
+                admitted_basis=abs(cand["basis_pct"]),
+                admitted_volume=cand["min_volume_24h"]
+            )
+            swaps_done += 1
+
+    async def _async_hot_swap_token(
+        self,
+        evict_tok: str,
+        admit_tok: str,
+        reason: str,
+        evicted_basis: float = 0.0,
+        admitted_basis: float = 0.0,
+        admitted_volume: float = 0.0,
+    ):
+        """
+        Dynamically hot-swap trading pairs on live connectors without restarting.
+        Unmounts evict_tok and mounts admit_tok via native add_trading_pair / remove_trading_pair.
+        """
+        async with self._universe_mutation_lock:
+            self.logger().info(
+                f"🔄 [UNIVERSE-HOT-SWAP] Starting hot-swap: Evicting '{evict_tok}' ➔ Admitting '{admit_tok}'. Reason: {reason}"
+            )
+
+            # 1. Unmount evicted token
+            for c_name, conn in self.connectors.items():
+                evict_pair = self.get_trading_pair_for_connector(evict_tok, c_name)
+                if hasattr(conn, "remove_trading_pair"):
+                    try:
+                        await conn.remove_trading_pair(evict_pair)
+                        self.logger().info(f"[UNIVERSE-HOT-SWAP] Removed {evict_pair} from {c_name}")
+                    except Exception as e:
+                        self.logger().warning(f"Error removing {evict_pair} from {c_name}: {e}")
+
+            # 2. Mount admitted token
+            for c_name, conn in self.connectors.items():
+                admit_pair = self.get_trading_pair_for_connector(admit_tok, c_name)
+                if hasattr(conn, "add_trading_pair"):
+                    try:
+                        success = await conn.add_trading_pair(admit_pair)
+                        self.logger().info(f"[UNIVERSE-HOT-SWAP] Added {admit_pair} to {c_name}: success={success}")
+                    except Exception as e:
+                        self.logger().warning(f"Error adding {admit_pair} to {c_name}: {e}")
+
+                if not self.config.dry_run and hasattr(conn, "set_leverage"):
+                    try:
+                        conn.set_leverage(admit_pair, self.config.leverage)
+                    except Exception as e:
+                        self.logger().warning(f"Error setting leverage for {admit_pair} on {c_name}: {e}")
+
+            # 3. Update configuration universe in memory
+            if isinstance(self.config.tokens, set):
+                self.config.tokens.discard(evict_tok)
+                self.config.tokens.add(admit_tok)
+            elif isinstance(self.config.tokens, list):
+                if evict_tok in self.config.tokens:
+                    self.config.tokens.remove(evict_tok)
+                if admit_tok not in self.config.tokens:
+                    self.config.tokens.append(admit_tok)
+
+            now_ts = time.time()
+            self.token_admitted_at[admit_tok] = now_ts
+            self.token_admitted_at.pop(evict_tok, None)
+
+            # 4. Record rotation history
+            rec = {
+                "timestamp": int(now_ts),
+                "time_str": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                "evicted_token": evict_tok,
+                "admitted_token": admit_tok,
+                "evicted_basis_pct": round(evicted_basis, 6),
+                "admitted_basis_pct": round(admitted_basis, 6),
+                "delta_edge_pct": round(admitted_basis - evicted_basis, 6),
+                "admitted_volume_usd": round(admitted_volume, 2),
+                "reason": reason,
+            }
+            self.rotation_history.append(rec)
+            if len(self.rotation_history) > 100:
+                self.rotation_history = self.rotation_history[-100:]
+
+            # 5. Persist state and sync to disk YAML if possible
+            self._persist_state()
+            self._sync_tokens_to_yaml_if_possible()
+            self.logger().info(
+                f"✅ [UNIVERSE-HOT-SWAP] Hot-swap complete! Universe now has {len(self.config.tokens)} tokens. "
+                f"New member '{admit_tok}' is now live in WebSocket stream."
+            )
+
+    def _sync_tokens_to_yaml_if_possible(self):
+        """Update script YAML config files with the current dynamically rotated tokens."""
+        tokens_str = ",".join(self.config.tokens)
+        conf_candidates = [
+            "/home/hummingbot/conf/scripts/basis_stat_arb_hyperliquid_binance_dry_run.yml",
+            "/home/hummingbot/conf/scripts/basis_stat_arb_hyperliquid_binance_micro_live.yml",
+        ]
+        for cpath in conf_candidates:
+            if os.path.exists(cpath):
+                try:
+                    import yaml
+                    with open(cpath, "r") as f:
+                        data = yaml.safe_load(f) or {}
+                    data["tokens"] = tokens_str
+                    with open(cpath, "w") as f:
+                        yaml.safe_dump(data, f, sort_keys=False)
+                    self.logger().info(f"[UNIVERSE-HOT-SWAP] Synced updated tokens to {cpath}")
+                except Exception as e:
+                    self.logger().warning(f"Could not update config yaml {cpath}: {e}")
