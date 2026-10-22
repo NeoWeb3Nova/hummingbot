@@ -1111,10 +1111,29 @@ class BasisStatArbitrage(StrategyV2Base):
             peak_pnl = max(pos.get("peak_pnl_pct", 0.0), float(net_pnl_pct))
             pos["peak_pnl_pct"] = peak_pnl
 
-            # ----------------- Exit Conditions -----------------
             # Anti-HFT Churn Defense: Enforce minimum holding time before allowing normal take-profit
             min_hold_s = getattr(self.config, "min_holding_seconds", 60)
             is_min_hold_passed = (duration_s >= min_hold_s)
+
+            # In-place update live position metrics so disk persistence and UI are 100% synchronized
+            pos["current_price_1"] = float(p1_curr)
+            pos["current_price_2"] = float(p2_curr)
+            pos["current_basis_pct"] = float(curr_basis)
+            pos["duration_seconds"] = int(duration_s)
+            pos["gross_unrealized_trading_pnl"] = float(gross_trading_pnl)
+            pos["net_unrealized_trading_pnl"] = float(net_trading_pnl)
+            pos["unrealized_trading_pnl"] = float(net_trading_pnl)
+            pos["total_pos_net"] = float(total_net_pnl)
+            pos["unrealized_roe_pct"] = float(net_roe_pct)
+            pos["trading_fee"] = float(est_roundtrip_fees)
+            pos["total_friction_cost"] = float(total_friction_cost)
+            pos["depth_slippage_cost"] = float(tot_depth_slip)
+            pos["latency_slippage_cost"] = float(tot_latency_slip)
+            pos["indicative_accrued_carry"] = float(indicative_carry)
+            pos["settlement_count"] = len(set(fp.get("timestamp") for fp in pos.get("funding_payments", []) if fp.get("timestamp")))
+            pos["min_holding_seconds"] = int(min_hold_s)
+
+            # ----------------- Exit Conditions -----------------
 
             # 1. Basis Compression Exit (Pure mathematical mean-reversion, no artificial profit masking):
             target_comp = Decimal(str(self.config.take_profit_basis_compression_pct))
