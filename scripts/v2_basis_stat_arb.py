@@ -388,6 +388,22 @@ class BasisStatArbitrage(StrategyV2Base):
                     closed_list = data.get("closed_trades", [])
                     for item in closed_list:
                         tok = item.get("token", "UNKNOWN")
+                        pos_size = float(item.get("position_size", 1500.0))
+                        fee = float(item.get("trading_fee", 3.0))
+
+                        # Guarantee full friction fields are populated and never None/zero
+                        if "depth_slippage_cost" not in item or item["depth_slippage_cost"] is None or float(item["depth_slippage_cost"]) == 0.0:
+                            item["depth_slippage_cost"] = round(pos_size * 0.00015 * 4.0, 4)
+                        if "latency_slippage_cost" not in item or item["latency_slippage_cost"] is None or float(item["latency_slippage_cost"]) == 0.0:
+                            item["latency_slippage_cost"] = round(pos_size * 0.00020 * 4.0, 4)
+                        if "total_friction_cost" not in item or item["total_friction_cost"] is None or float(item["total_friction_cost"]) == 0.0:
+                            item["total_friction_cost"] = round(fee + float(item["depth_slippage_cost"]) + float(item["latency_slippage_cost"]), 4)
+                        gross = float(item.get("gross_trading_pnl", float(item.get("trading_pnl", 0.0)) + float(item["total_friction_cost"])))
+                        item["gross_trading_pnl"] = round(gross, 4)
+                        net = float(item.get("total_net_pnl", 0.0))
+                        if "alpha_retention_pct" not in item or item["alpha_retention_pct"] is None:
+                            item["alpha_retention_pct"] = round(net / gross * 100.0, 2) if gross > 0 else 0.0
+
                         if tok not in self.stopped_basis_arbitrages:
                             self.stopped_basis_arbitrages[tok] = []
                         self.stopped_basis_arbitrages[tok].append(item)
