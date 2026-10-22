@@ -141,8 +141,37 @@ class BasisStatArbitrageConfig(StrategyV2ConfigBase):
     max_orderbook_depth_ratio: Decimal = Field(
         default=Decimal("0.20"),
         json_schema_extra={
-            "prompt": lambda mi: "Max position size ratio vs top 25 orderbook depth (e.g. 0.20): ",
+            "prompt": lambda mi: "Max position size ratio vs top orderbook depth (e.g. 0.20): ",
             "prompt_on_new": True
+        }
+    )
+    dynamic_capacity_sizing: bool = Field(
+        default=True,
+        json_schema_extra={
+            "prompt": lambda mi: "Dynamically adapt position size based on top 3 orderbook depth? (True/False): ",
+            "prompt_on_new": True,
+        }
+    )
+    min_order_size_quote: Decimal = Field(
+        default=Decimal("300.0"),
+        gt=Decimal("0"),
+        json_schema_extra={
+            "prompt": lambda mi: "Min order size in quote asset per leg under dynamic capacity sizing (e.g. 300.0 USD): ",
+            "prompt_on_new": True,
+        }
+    )
+    min_executable_net_edge_pct: Decimal = Field(
+        default=Decimal("0.0030"),
+        json_schema_extra={
+            "prompt": lambda mi: "Min executable VWAP net edge after taker fees and slippage (e.g. 0.0030 for 30 bps): ",
+            "prompt_on_new": True,
+        }
+    )
+    max_executable_depth_slippage_pct: Decimal = Field(
+        default=Decimal("0.0025"),
+        json_schema_extra={
+            "prompt": lambda mi: "Max allowable single-leg orderbook depth slippage (e.g. 0.0025 for 25 bps): ",
+            "prompt_on_new": True,
         }
     )
     min_holding_seconds: int = Field(
@@ -563,6 +592,52 @@ class BasisStatArbitrage(StrategyV2Base):
         except Exception as e:
             self.logger().error(f"Error handling live funding payment: {e}")
 
+    def get_orderbook_depth_summary(
+        self,
+        connector_name: str,
+        trading_pair: str,
+        is_buy: bool,
+        top_n: int = 3
+    ) -> Tuple[Decimal, Decimal]:
+        """
+        Calculates quote depth (in USD/quote asset) for top 1 and top N price levels in L2 order book.
+        - is_buy: True evaluates Ask book (liquidity to buy)
+        - is_buy: False evaluates Bid book (liquidity to sell)
+        Returns: (top1_quote_depth, top_n_quote_depth)
+        """
+        try:
+            connector = self.connectors.get(connector_name)
+            if not connector:
+                return Decimal("0"), Decimal("0")
+            order_book = connector.get_order_book(trading_pair)
+            if not order_book:
+                return Decimal("0"), Decimal("0")
+
+            bids_df, asks_df = order_book.snapshot
+            df = asks_df if is_buy else bids_df
+            if df is None or len(df) == 0:
+                return Decimal("0"), Decimal("0")
+
+            top1_depth = Decimal("0")
+            top_n_depth = Decimal("0")
+
+            n_rows = min(top_n, len(df))
+            for idx in range(n_rows):
+                p_val = df.iloc[idx]["price"]
+                q_val = df.iloc[idx]["amount"]
+                if math.isnan(float(p_val)) or math.isnan(float(q_val)):
+                    continue
+                p = Decimal(str(p_val))
+                q = Decimal(str(q_val))
+                cost = p * q
+                if idx == 0:
+                    top1_depth = cost
+                top_n_depth += cost
+
+            return top1_depth, top_n_depth
+        except Exception:
+            return Decimal("0"), Decimal("0")
+
     def get_orderbook_execution_metrics(
         self,
         connector_name: str,
@@ -755,34 +830,65 @@ class BasisStatArbitrage(StrategyV2Base):
             tp1 = self.get_trading_pair_for_connector(token, c1)
             tp2 = self.get_trading_pair_for_connector(token, c2)
 
-            pos_size = self.config.position_size_quote
             m1 = Decimal(str(self.get_token_multiplier(token, c1)))
             m2 = Decimal(str(self.get_token_multiplier(token, c2)))
 
-            # Query real executable orderbook metrics for pos_size on BOTH exchanges
-            # Sell leg hits Bid (is_buy=False); Buy leg hits Ask (is_buy=True)
-            p1_bid_best, p1_bid_vwap, p1_bid_exec, p1_bid_slip = self.get_orderbook_execution_metrics(c1, tp1, is_buy=False, quote_volume=pos_size)
-            p1_ask_best, p1_ask_vwap, p1_ask_exec, p1_ask_slip = self.get_orderbook_execution_metrics(c1, tp1, is_buy=True, quote_volume=pos_size)
-            p2_bid_best, p2_bid_vwap, p2_bid_exec, p2_bid_slip = self.get_orderbook_execution_metrics(c2, tp2, is_buy=False, quote_volume=pos_size)
-            p2_ask_best, p2_ask_vwap, p2_ask_exec, p2_ask_slip = self.get_orderbook_execution_metrics(c2, tp2, is_buy=True, quote_volume=pos_size)
+            # Query Top 3 OrderBook depth for candidate directions
+            c1_bid_top1, c1_bid_top3 = self.get_orderbook_depth_summary(c1, tp1, is_buy=False, top_n=3)
+            c1_ask_top1, c1_ask_top3 = self.get_orderbook_depth_summary(c1, tp1, is_buy=True, top_n=3)
+            c2_bid_top1, c2_bid_top3 = self.get_orderbook_depth_summary(c2, tp2, is_buy=False, top_n=3)
+            c2_ask_top1, c2_ask_top3 = self.get_orderbook_depth_summary(c2, tp2, is_buy=True, top_n=3)
 
-            # Strict Guard: If any order book quote cannot be obtained, skip token completely
-            # Zero tolerance for dummy fallback prices like MidPrice, LastTradePrice, or 1.0!
-            if p1_bid_exec is None or p1_ask_exec is None or p2_bid_exec is None or p2_ask_exec is None:
+            # Dynamic Capacity Sizing:
+            # Safe capacity is scaled to top 3 orderbook depth (default 20%) to prevent adverse market impact.
+            # Direction A: Sell C1 @ Bid, Buy C2 @ Ask -> bottleneck depth is min(c1_bid_top3, c2_ask_top3)
+            # Direction B: Buy C1 @ Ask, Sell C2 @ Bid -> bottleneck depth is min(c1_ask_top3, c2_bid_top3)
+            ratio = getattr(self.config, "max_orderbook_depth_ratio", Decimal("0.20"))
+            min_order_sz = getattr(self.config, "min_order_size_quote", Decimal("300.0"))
+            base_pos_sz = self.config.position_size_quote
+            is_dynamic = getattr(self.config, "dynamic_capacity_sizing", True)
+
+            depth_top3_A = min(c1_bid_top3, c2_ask_top3)
+            depth_top3_B = min(c1_ask_top3, c2_bid_top3)
+
+            if is_dynamic:
+                pos_size_A = None if depth_top3_A < min_order_sz else min(base_pos_sz, max(min_order_sz, depth_top3_A * ratio))
+                pos_size_B = None if depth_top3_B < min_order_sz else min(base_pos_sz, max(min_order_sz, depth_top3_B * ratio))
+            else:
+                pos_size_A = base_pos_sz
+                pos_size_B = base_pos_sz
+
+            if pos_size_A is None and pos_size_B is None:
+                self.logger().debug(
+                    f"🛡️ [LIQUIDITY-MIRAGE-INTERCEPT] Token '{token}' Top 3 depth "
+                    f"(Dir A: ${float(depth_top3_A):,.1f}, Dir B: ${float(depth_top3_B):,.1f}) "
+                    f"below minimum order size (${float(min_order_sz):,.1f}). Entry blocked."
+                )
                 self.entry_candidate_ticks[token] = 0
                 continue
 
-            # Normalized executable prices (using simulated execution price including order book depth & latency)
-            p1_bid_norm = p1_bid_exec / m1
-            p1_ask_norm = p1_ask_exec / m1
-            p2_bid_norm = p2_bid_exec / m2
-            p2_ask_norm = p2_ask_exec / m2
+            # Query real executable orderbook metrics for direction-specific pos_size on BOTH exchanges
+            spread_A = Decimal("-999")
+            p1_bid_best = p1_bid_vwap = p1_bid_exec = p1_bid_slip = None
+            p2_ask_best = p2_ask_vwap = p2_ask_exec = p2_ask_slip = None
+            if pos_size_A is not None:
+                p1_bid_best, p1_bid_vwap, p1_bid_exec, p1_bid_slip = self.get_orderbook_execution_metrics(c1, tp1, is_buy=False, quote_volume=pos_size_A)
+                p2_ask_best, p2_ask_vwap, p2_ask_exec, p2_ask_slip = self.get_orderbook_execution_metrics(c2, tp2, is_buy=True, quote_volume=pos_size_A)
+                if p1_bid_exec is not None and p2_ask_exec is not None:
+                    p1_bid_norm = p1_bid_exec / m1
+                    p2_ask_norm = p2_ask_exec / m2
+                    spread_A = (p1_bid_norm - p2_ask_norm) / p2_ask_norm
 
-            # Direction A: Sell C1 @ Bid1, Buy C2 @ Ask2 (Overvalued C1, Undervalued C2)
-            spread_A = (p1_bid_norm - p2_ask_norm) / p2_ask_norm
-
-            # Direction B: Buy C1 @ Ask1, Sell C2 @ Bid2 (Undervalued C1, Overvalued C2)
-            spread_B = (p2_bid_norm - p1_ask_norm) / p1_ask_norm
+            spread_B = Decimal("-999")
+            p1_ask_best = p1_ask_vwap = p1_ask_exec = p1_ask_slip = None
+            p2_bid_best = p2_bid_vwap = p2_bid_exec = p2_bid_slip = None
+            if pos_size_B is not None:
+                p1_ask_best, p1_ask_vwap, p1_ask_exec, p1_ask_slip = self.get_orderbook_execution_metrics(c1, tp1, is_buy=True, quote_volume=pos_size_B)
+                p2_bid_best, p2_bid_vwap, p2_bid_exec, p2_bid_slip = self.get_orderbook_execution_metrics(c2, tp2, is_buy=False, quote_volume=pos_size_B)
+                if p1_ask_exec is not None and p2_bid_exec is not None:
+                    p1_ask_norm = p1_ask_exec / m1
+                    p2_bid_norm = p2_bid_exec / m2
+                    spread_B = (p2_bid_norm - p1_ask_norm) / p1_ask_norm
 
             min_entry = self.config.min_entry_basis_pct
 
@@ -793,25 +899,70 @@ class BasisStatArbitrage(StrategyV2Base):
                 c1_best_price = p1_bid_best
                 c1_vwap_price = p1_bid_vwap
                 c1_exec_price = p1_bid_exec
+                c1_slip = p1_bid_slip or Decimal("0")
                 c2_best_price = p2_ask_best
                 c2_vwap_price = p2_ask_vwap
                 c2_exec_price = p2_ask_exec
+                c2_slip = p2_ask_slip or Decimal("0")
                 c1_norm = p1_bid_norm
                 c2_norm = p2_ask_norm
                 executable_basis_spread = spread_A
+                pos_size = pos_size_A
+                top3_c1 = c1_bid_top3
+                top3_c2 = c2_ask_top3
             elif spread_B >= min_entry and spread_B > spread_A:
                 c1_side = TradeType.BUY
                 c2_side = TradeType.SELL
                 c1_best_price = p1_ask_best
                 c1_vwap_price = p1_ask_vwap
                 c1_exec_price = p1_ask_exec
+                c1_slip = p1_ask_slip or Decimal("0")
                 c2_best_price = p2_bid_best
                 c2_vwap_price = p2_bid_vwap
                 c2_exec_price = p2_bid_exec
+                c2_slip = p2_bid_slip or Decimal("0")
                 c1_norm = p1_ask_norm
                 c2_norm = p2_bid_norm
                 executable_basis_spread = spread_B
+                pos_size = pos_size_B
+                top3_c1 = c1_ask_top3
+                top3_c2 = c2_bid_top3
             else:
+                self.entry_candidate_ticks[token] = 0
+                continue
+
+            # ----------------- Executable VWAP Filter & Friction Gates -----------------
+            # 1. Single-leg depth slippage ceiling:
+            max_depth_slip_limit = getattr(self.config, "max_executable_depth_slippage_pct", Decimal("0.0025"))
+            max_leg_slip = max(c1_slip, c2_slip)
+            if max_leg_slip > max_depth_slip_limit:
+                self.logger().info(
+                    f"🛡️ [LIQUIDITY-MIRAGE-INTERCEPT] Token '{token}' single-leg depth slippage ({float(max_leg_slip):.3%}) "
+                    f"exceeds ceiling ({float(max_depth_slip_limit):.3%}). "
+                    f"Leg 1 ({c1}): {float(c1_slip):.3%}, Leg 2 ({c2}): {float(c2_slip):.3%}. Entry blocked."
+                )
+                self.entry_candidate_ticks[token] = 0
+                continue
+
+            # 2. VWAP Net Executable Edge Gate:
+            vwap_norm_1 = c1_vwap_price / m1
+            vwap_norm_2 = c2_vwap_price / m2
+            raw_vwap_basis = abs(vwap_norm_1 - vwap_norm_2) / min(vwap_norm_1, vwap_norm_2)
+
+            roundtrip_taker_fees = getattr(self.config, "taker_fee_rate", Decimal("0.0005")) * Decimal("4.0")
+            roundtrip_latency = getattr(self.config, "simulated_latency_slippage_pct", Decimal("0.0002")) * Decimal("4.0")
+            est_exit_depth_slip = c1_slip + c2_slip
+            total_friction_spread = roundtrip_taker_fees + roundtrip_latency + est_exit_depth_slip
+            net_executable_edge = raw_vwap_basis - total_friction_spread
+
+            min_net_edge_limit = getattr(self.config, "min_executable_net_edge_pct", Decimal("0.0030"))
+            if net_executable_edge < min_net_edge_limit:
+                self.logger().info(
+                    f"🛡️ [LIQUIDITY-MIRAGE-INTERCEPT] Token '{token}' Net Executable Edge ({float(net_executable_edge):.3%}) "
+                    f"below required threshold ({float(min_net_edge_limit):.3%}). "
+                    f"Raw VWAP Basis: {float(raw_vwap_basis):.3%}, Friction: {float(total_friction_spread):.3%} "
+                    f"(Fees {float(roundtrip_taker_fees):.3%} + Latency {float(roundtrip_latency):.3%} + ExitSlip {float(est_exit_depth_slip):.3%}). Entry blocked."
+                )
                 self.entry_candidate_ticks[token] = 0
                 continue
 
@@ -940,6 +1091,12 @@ class BasisStatArbitrage(StrategyV2Base):
                 "entry_basis_pct": float(executable_basis_spread),
                 "target_compression_pct": float(self.config.take_profit_basis_compression_pct),
                 "position_size": float(pos_size),
+                "safe_capacity": float(pos_size),
+                "top3_depth_1": float(top3_c1),
+                "top3_depth_2": float(top3_c2),
+                "net_executable_edge_pct": float(net_executable_edge),
+                "entry_depth_slip_pct_1": float(c1_slip),
+                "entry_depth_slip_pct_2": float(c2_slip),
                 "single_notional": float(pos_size),
                 "total_notional": float(tot_notional),
                 "leverage": self.config.leverage,
@@ -1295,6 +1452,10 @@ class BasisStatArbitrage(StrategyV2Base):
                 "entry_basis_pct": pos["entry_basis_pct"],
                 "close_basis_pct": item["close_basis_pct"],
                 "position_size": pos["position_size"],
+                "safe_capacity": pos.get("safe_capacity", pos_size_val),
+                "top3_depth_1": pos.get("top3_depth_1", 0.0),
+                "top3_depth_2": pos.get("top3_depth_2", 0.0),
+                "net_executable_edge_pct": pos.get("net_executable_edge_pct", 0.0),
                 "single_notional": pos_size_val,
                 "total_notional": tot_notional_val,
                 "leverage": pos["leverage"],
@@ -1526,11 +1687,36 @@ class BasisStatArbitrage(StrategyV2Base):
                     p1_ind = self.get_indicative_price(c1, tp1)
                     p2_ind = self.get_indicative_price(c2, tp2)
 
-                    # Executable Bid/Ask quotes for determining true executable spreads
-                    p1_bid = self.get_executable_quote_price(c1, tp1, quote_vol, is_buy=False)
-                    p1_ask = self.get_executable_quote_price(c1, tp1, quote_vol, is_buy=True)
-                    p2_bid = self.get_executable_quote_price(c2, tp2, quote_vol, is_buy=False)
-                    p2_ask = self.get_executable_quote_price(c2, tp2, quote_vol, is_buy=True)
+                    # Top 3 depths for both connectors
+                    c1_bid_t1, c1_bid_t3 = self.get_orderbook_depth_summary(c1, tp1, is_buy=False, top_n=3)
+                    c1_ask_t1, c1_ask_t3 = self.get_orderbook_depth_summary(c1, tp1, is_buy=True, top_n=3)
+                    c2_bid_t1, c2_bid_t3 = self.get_orderbook_depth_summary(c2, tp2, is_buy=False, top_n=3)
+                    c2_ask_t1, c2_ask_t3 = self.get_orderbook_depth_summary(c2, tp2, is_buy=True, top_n=3)
+
+                    c1_top3_avg = (c1_bid_t3 + c1_ask_t3) / Decimal("2.0")
+                    c2_top3_avg = (c2_bid_t3 + c2_ask_t3) / Decimal("2.0")
+                    min_top3 = min(c1_top3_avg, c2_top3_avg)
+                    ratio = getattr(self.config, "max_orderbook_depth_ratio", Decimal("0.20"))
+                    min_order_sz = getattr(self.config, "min_order_size_quote", Decimal("300.0"))
+                    base_sz = self.config.position_size_quote
+                    is_dynamic = getattr(self.config, "dynamic_capacity_sizing", True)
+                    
+                    if is_dynamic:
+                        safe_cap = min(base_sz, max(min_order_sz, min_top3 * ratio)) if min_top3 >= min_order_sz else min_top3
+                    else:
+                        safe_cap = base_sz
+
+                    # Executable quotes using safe capacity
+                    test_vol = max(Decimal("10.0"), safe_cap)
+                    p1_bid_b, p1_bid_v, p1_bid_exec, p1_bid_s = self.get_orderbook_execution_metrics(c1, tp1, is_buy=False, quote_volume=test_vol)
+                    p1_ask_b, p1_ask_v, p1_ask_exec, p1_ask_s = self.get_orderbook_execution_metrics(c1, tp1, is_buy=True, quote_volume=test_vol)
+                    p2_bid_b, p2_bid_v, p2_bid_exec, p2_bid_s = self.get_orderbook_execution_metrics(c2, tp2, is_buy=False, quote_volume=test_vol)
+                    p2_ask_b, p2_ask_v, p2_ask_exec, p2_ask_s = self.get_orderbook_execution_metrics(c2, tp2, is_buy=True, quote_volume=test_vol)
+
+                    p1_bid = p1_bid_exec
+                    p1_ask = p1_ask_exec
+                    p2_bid = p2_bid_exec
+                    p2_ask = p2_ask_exec
 
                     f_info = self.get_funding_info_by_token(t)
                     r1 = float(self.get_normalized_funding_rate_in_seconds(f_info, c1) * 86400)
@@ -1546,8 +1732,22 @@ class BasisStatArbitrage(StrategyV2Base):
                         spread_buy1_sell2 = (p2_bid_n - p1_ask_n) / p1_ask_n
                         best_spread = max(spread_sell1_buy2, spread_buy1_sell2)
 
+                        # Net edge calculation
+                        taker_fees = float(getattr(self.config, "taker_fee_rate", Decimal("0.0005")) * 4)
+                        latency_fees = float(getattr(self.config, "simulated_latency_slippage_pct", Decimal("0.0002")) * 4)
+                        if spread_sell1_buy2 >= spread_buy1_sell2:
+                            slip_est = float((p1_bid_s or Decimal("0")) + (p2_ask_s or Decimal("0")))
+                        else:
+                            slip_est = float((p1_ask_s or Decimal("0")) + (p2_bid_s or Decimal("0")))
+                        net_edge = best_spread - taker_fees - latency_fees - slip_est
+
                         thresh = float(self.config.min_entry_basis_pct)
-                        if best_spread >= thresh:
+                        min_edge_thresh = float(getattr(self.config, "min_executable_net_edge_pct", Decimal("0.0030")))
+                        if min_top3 < min_order_sz:
+                            status_str = f"🛡️ 流动性虚幻/拦截 (Top3: ${float(min_top3):,.0f})"
+                        elif best_spread >= thresh and net_edge < min_edge_thresh:
+                            status_str = f"🛡️ 穿透拦截 (净利 {net_edge:+.2%} < 30bps)"
+                        elif best_spread >= thresh:
                             dir_str = "Short C1/Long C2" if spread_sell1_buy2 >= spread_buy1_sell2 else "Long C1/Short C2"
                             status_str = f"⚡ 偏离超标 {best_spread:+.2%} ({dir_str})"
                         else:
@@ -1557,6 +1757,7 @@ class BasisStatArbitrage(StrategyV2Base):
                         display_p2 = float(p2_ind) if p2_ind is not None else float(p2_ask)
                     else:
                         best_spread = 0.0
+                        net_edge = 0.0
                         display_p1 = float(p1_ind) if p1_ind is not None else 0.0
                         display_p2 = float(p2_ind) if p2_ind is not None else 0.0
                         status_str = "⏳ 深度暂缺/无法撮合"
@@ -1571,6 +1772,10 @@ class BasisStatArbitrage(StrategyV2Base):
                         "c2_funding_daily": r2,
                         "carry_if_short_c1": r1 - r2,
                         "dislocation_status": status_str,
+                        "c1_top3_depth": float(c1_top3_avg),
+                        "c2_top3_depth": float(c2_top3_avg),
+                        "safe_capacity": float(safe_cap),
+                        "net_executable_edge_pct": float(net_edge),
                     })
                 except Exception:
                     pass
@@ -1622,6 +1827,8 @@ class BasisStatArbitrage(StrategyV2Base):
         lines.append(f"  Mode: {'Dry-Run (Paper)' if self.config.dry_run else 'Live Real Trading'}")
         lines.append(f"  Connectors: {', '.join(self.config.connectors)} | Leverage: {lev}x")
         lines.append(f"  Position Sizing Matrix: 单边货值 ${pos_cfg:,.2f} | 双边总敞口 ${dual_cfg:,.2f} | 双边实缴保证金 ${margin_cfg:,.2f}")
+        lines.append(f"  Dynamic Sizing: {'Enabled (Top3 Depth Cap)' if getattr(self.config, 'dynamic_capacity_sizing', True) else 'Disabled'} | Min Order: ${float(getattr(self.config, 'min_order_size_quote', Decimal('300.0'))):,.0f}")
+        lines.append(f"  Executable VWAP Gates: Min Net Edge {float(getattr(self.config, 'min_executable_net_edge_pct', Decimal('0.0030'))):.2%} | Max Leg Slip {float(getattr(self.config, 'max_executable_depth_slippage_pct', Decimal('0.0025'))):.2%}")
         lines.append(f"  Active Positions: {len(self.active_basis_arbitrages)}")
         for tok, pos in self.active_basis_arbitrages.items():
             amt1 = float(pos.get("amount_1", float(pos["position_size"]) / float(pos["entry_price_1"]) if float(pos["entry_price_1"]) > 0 else 0.0))
