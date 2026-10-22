@@ -229,9 +229,9 @@ class BasisStatArbitrageConfig(StrategyV2ConfigBase):
         }
     )
     auto_rotation_min_entry_basis_pct: Decimal = Field(
-        default=Decimal("0.0070"),
+        default=Decimal("0.0030"),
         json_schema_extra={
-            "prompt": lambda mi: "Min indicative basis for candidate token to qualify for admission (e.g. 0.0070 for 0.70%): ",
+            "prompt": lambda mi: "Min indicative basis for candidate token to qualify for admission (e.g. 0.0030 for 0.30%): ",
             "prompt_on_new": False,
         }
     )
@@ -2178,7 +2178,7 @@ class BasisStatArbitrage(StrategyV2Base):
         if not getattr(self.config, "auto_rotation_enabled", True):
             return
 
-        min_entry_basis = float(getattr(self.config, "auto_rotation_min_entry_basis_pct", Decimal("0.0070")))
+        min_entry_basis = float(getattr(self.config, "auto_rotation_min_entry_basis_pct", Decimal("0.0030")))
         min_vol_bn = float(getattr(self.config, "auto_rotation_min_volume_24h_usd", Decimal("2000000.0")))
         min_vol_hl = 500000.0
         min_delta_edge = float(getattr(self.config, "auto_rotation_min_delta_edge_pct", Decimal("0.0030")))
