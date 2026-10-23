@@ -2066,7 +2066,7 @@ class BasisStatArbitrage(StrategyV2Base):
             # Force IPv4 preference for container compatibility
             socket.getaddrinfo = getaddrinfo_ipv4
 
-            # 1. Hyperliquid perpetuals
+            # 1. Hyperliquid perpetuals (filter out delisted tokens & inactive orderbooks)
             hl_req = urllib.request.Request(
                 "https://api.hyperliquid.xyz/info",
                 data=json.dumps({"type": "metaAndAssetCtxs"}).encode("utf-8"),
@@ -2077,10 +2077,19 @@ class BasisStatArbitrage(StrategyV2Base):
 
             hl_assets = {}
             for i, asset_meta in enumerate(hl_raw[0].get("universe", [])):
+                # Gate 1: Explicit delisting check (Hyperliquid sets isDelisted: True for ceased markets)
+                if asset_meta.get("isDelisted", False):
+                    continue
+
                 name = asset_meta.get("name")
                 if i < len(hl_raw[1]):
                     ctx = hl_raw[1][i]
-                    mid = float(ctx.get("midPx") or ctx.get("markPx") or 0.0)
+                    # Gate 2: Active orderbook verification (midPx is None if trading is halted or no quotes)
+                    mid_px = ctx.get("midPx")
+                    if mid_px is None:
+                        continue
+
+                    mid = float(mid_px)
                     vol = float(ctx.get("dayNtlVlm") or 0.0)
                     funding = float(ctx.get("funding") or 0.0)
                     hl_assets[name] = {"price": mid, "volume_24h": vol, "funding_rate": funding}
@@ -2104,41 +2113,56 @@ class BasisStatArbitrage(StrategyV2Base):
                         "symbol": sym
                     }
 
+            canonical_multipliers = {
+                "kPEPE": 1000.0, "kBONK": 1000.0, "kSHIB": 1000.0, "kFLOKI": 1000.0,
+                "kLUNC": 1000.0, "kNEIRO": 1000.0, "kDOGS": 1000.0
+            }
             canonical_reverse = {
-                "1000PEPE": "PEPE", "1000FLOKI": "FLOKI", "1000BONK": "BONK",
-                "1000SHIB": "SHIB", "kSHIB": "SHIB", "1000SATS": "SATS", "kSATS": "SATS",
-                "1000LUNC": "LUNC", "1000XEC": "XEC", "1000RATS": "RATS"
+                "kPEPE": "1000PEPE", "kBONK": "1000BONK", "kSHIB": "1000SHIB", "kFLOKI": "1000FLOKI",
+                "kLUNC": "1000LUNC", "kNEIRO": "NEIRO", "1000PEPE": "1000PEPE", "1000BONK": "1000BONK",
+                "1000SHIB": "1000SHIB", "1000FLOKI": "1000FLOKI", "1000SATS": "1000SATS", "1000RATS": "1000RATS",
+                "1000CAT": "1000CAT", "1000XEC": "1000XEC"
             }
 
             active_tokens_set = set(self.config.tokens)
             candidates = []
 
             for hl_name, hl_data in hl_assets.items():
+                mult_hl = canonical_multipliers.get(hl_name, 1.0)
                 norm_hl = canonical_reverse.get(hl_name, hl_name)
+                mult_bn = 1.0
                 bn_match = None
+
                 if norm_hl in bn_assets:
                     bn_match = norm_hl
+                    if norm_hl.startswith("1000") and not hl_name.startswith(("1000", "k")):
+                        mult_bn = 1000.0
                 elif f"1000{norm_hl}" in bn_assets:
                     bn_match = f"1000{norm_hl}"
+                    mult_bn = 1000.0
 
-                if bn_match:
+                if bn_match and bn_match in bn_assets:
                     bn_data = bn_assets[bn_match]
-                    hl_px = hl_data["price"]
-                    bn_px = bn_data["price"]
-                    if bn_match.startswith("1000") and not hl_name.startswith(("1000", "k")):
-                        bn_px = bn_px / 1000.0
-                    elif hl_name.startswith(("1000", "k")) and not bn_match.startswith("1000"):
-                        hl_px = hl_px / 1000.0
+                    hl_px = hl_data["price"] / mult_hl
+                    bn_px = bn_data["price"] / mult_bn
 
                     if bn_px > 0 and hl_px > 0:
+                        # Gate 3: Normalized Price Divergence Circuit Breaker (Homonym & Split Guard)
+                        # Two contracts tracking the same underlying asset never diverge by >2.0% in normal markets.
+                        avg_px = (hl_px + bn_px) / 2.0
+                        divergence = abs(hl_px - bn_px) / avg_px
+                        if divergence > 0.02:
+                            # Rejects homonym ticker collisions, rebrand desyncs (e.g. RNDR vs RENDER), or fake pairs
+                            continue
+
                         basis_pct = (hl_px - bn_px) / bn_px
                         hl_vol = hl_data["volume_24h"]
                         bn_vol = bn_data["volume_24h"]
                         min_vol = min(hl_vol, bn_vol)
-                        is_active = norm_hl in active_tokens_set
+                        is_active = norm_hl in active_tokens_set or hl_name in active_tokens_set
 
                         candidates.append({
-                            "token": norm_hl,
+                            "token": norm_hl if not norm_hl.startswith("1000") else norm_hl[4:],
                             "hl_symbol": hl_name,
                             "bn_symbol": bn_match,
                             "hl_price": hl_px,
