@@ -1784,6 +1784,18 @@ class BasisStatArbitrage(StrategyV2Base):
             margin2_val = float(pos.get("margin_2", (amt2_val * p2_entry_val) / lev_val if lev_val > 0 else pos_size_val))
             tot_margin_val = float(pos.get("total_margin", margin1_val + margin2_val))
 
+            # Direction-aware captured basis:
+            # When side_1 == "SELL" (Short C1 / Long C2): entry_basis - close_basis
+            # When side_1 == "BUY" (Long C1 / Short C2): entry_basis + close_basis (since close_basis is (P1 - P2)/P2)
+            side_1_str = pos.get("side_1", "SELL")
+            eb_val = float(pos["entry_basis_pct"])
+            cb_val = float(item["close_basis_pct"])
+            if side_1_str == "SELL":
+                captured_basis_pct = eb_val - cb_val
+            else:
+                captured_basis_pct = eb_val + cb_val
+            captured_basis_bps = captured_basis_pct * 10000.0
+
             record = {
                 "token": token,
                 "connector_1": pos["connector_1"],
@@ -1802,6 +1814,8 @@ class BasisStatArbitrage(StrategyV2Base):
                 "close_best_price_2": item.get("close_best_p2", item["close_p2"]),
                 "entry_basis_pct": pos["entry_basis_pct"],
                 "close_basis_pct": item["close_basis_pct"],
+                "captured_basis_pct": round(captured_basis_pct, 6),
+                "captured_basis_bps": round(captured_basis_bps, 2),
                 "position_size": pos["position_size"],
                 "safe_capacity": pos.get("safe_capacity", pos_size_val),
                 "top3_depth_1": pos.get("top3_depth_1", 0.0),
@@ -1844,6 +1858,7 @@ class BasisStatArbitrage(StrategyV2Base):
                 f"🎯 [BASIS-POSITION-CLOSED] Token '{token}' ({item['reason']})!\n"
                 f"  Capital Sizing: 单边 ${pos_size_val:,.2f} | 双边 ${tot_notional_val:,.2f} | 实缴保证金 ${tot_margin_val:,.2f} ({lev_val:.0f}x)\n"
                 f"  Quantities: {pos['side_1']} {amt1_val:,.4f} {token} ({pos['connector_1']}) + {pos['side_2']} {amt2_val:,.4f} {token} ({pos['connector_2']})\n"
+                f"  Basis Dynamics: 开仓 {pos['entry_basis_pct']:+.2%} ➔ 平仓 {item['close_basis_pct']:+.2%} | 实际捕获基差: {captured_basis_bps:+.1f} bps ({captured_basis_pct:+.2%})\n"
                 f"  Friction Audit: Gross ${item['gross_trading_pnl']:+.2f} - DepthSlip ${item['depth_slippage_cost']:.2f} - LatencySlip ${item['latency_slippage_cost']:.2f} - Fee ${item['trading_fee']:.2f} = NetTrade ${item['net_trading_pnl']:+.2f}\n"
                 f"  Settled Funding: ${item['settled_funding_pnl']:+.2f} ({unique_windows} windows), Total Net: ${item['total_net_pnl']:+.2f} (ROE {item['net_roe_pct']:+.2%}, Alpha Retention: {item['alpha_retention_pct']:.1f}%), Held: {item['duration_seconds']}s"
             )
@@ -1874,6 +1889,8 @@ class BasisStatArbitrage(StrategyV2Base):
                 "close_price_2": pos["entry_price_2"],
                 "entry_basis_pct": pos["entry_basis_pct"],
                 "close_basis_pct": pos["entry_basis_pct"],
+                "captured_basis_pct": 0.0,
+                "captured_basis_bps": 0.0,
                 "position_size": pos["position_size"],
                 "leverage": pos["leverage"],
                 "gross_trading_pnl": 0.0,

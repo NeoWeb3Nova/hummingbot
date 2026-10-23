@@ -1292,3 +1292,48 @@ $$Size_{quote} = \min\left(Size_{target}, \sum_{k=1}^{25} (P_k \times Q_k)_{c1} 
 - **验证与质量保障**：
   - 针对卡片流 HTML 渲染结构与多模切换新增 2 项全景测试；
   - `hummingbot-dashboard` 26 项测试 + `hummingbot-api` 12 项测试 100% 通过。
+
+---
+
+### 42. 实际捕获基差（Captured Basis Spread in BPS）高保真量化归档与双端透视体系
+- **需求与交易员心算痛点（Elimination of Mental Math in Spread Attribution）**：
+  - 用户反馈：“你是不是应该把这个差值，也就是你刚才算的实际普货价差，这个 BPS 数值，也在结算的时候体现一下？就是在我们那个战绩里边体现一下？这个参数加起来应该不难吧？而且加上之后就不用再算了。我看到你已经有开仓的时候一个价差，还有出仓的时候一个价差。那我们是不是可以直接算这个差值？”
+  - **量化交易的核心因果链**：在均值回归统计套利中，交易员与资金出资方最为关切的 Alpha 核心来源就是：**“本笔交易在双边市场价差波动中，到底净咬下了多少个基点（BPS / %）的价差空间？”**
+  - 过去界面与持久化中仅记录了“开仓基差（例如 +0.53%）”与“平仓基差（例如 +0.03%）”，用户需要自行心算 `+0.53% - 0.03% = 50 bps`。更严重的是，当开仓方向不同（做空腿在不同交易所）或行情穿透均值（基差翻转反向穿透）时，符号与加减逻辑不同，极易引发认知混淆与心算失误。
+- **多空双向自适应的量化数学精算模型**：
+  1. **入场与出场基差标准定义**：
+     - 入场基差 `entry_basis_pct` 恒定记录有利于建仓方向的正向基差（$|Spread| \ge 0.50\%$）；
+     - 出场基差 `close_basis_pct` 采用基准标量定义：$Close Basis = (P_1 - P_2) / P_2$；
+  2. **Direction A: Short Leg 1 / Long Leg 2 (`side_1 == "SELL"`)**：
+     - 入场时 $P_1 > P_2$，$Entry Basis = (P_1 - P_2) / P_2 > 0$；
+     - 出场时基差收敛至 $Close Basis$，剩余未收敛价差即为 $Close Basis$；
+     - **捕获基差公式**：
+       $$\Delta \text{Captured Basis} = \text{Entry Basis} - \text{Close Basis}$$
+     - *实战对账（Trade #9 REZ）*：开仓 $+0.5252\%$，平仓 $+0.0285\%$：
+       $$\Delta = +0.5252\% - (+0.0285\%) = +0.4967\% = \mathbf{+49.7\text{ bps}}$$
+       毛利验证：$+0.4967\% \times \$416.7 \approx \$2.07$，与系统录得的毛价差 `$2.07` 严丝合缝！
+  3. **Direction B: Long Leg 1 / Short Leg 2 (`side_1 == "BUY"`)**：
+     - 入场时 $P_2 > P_1$，$Entry Basis = (P_2 - P_1) / P_1 > 0$；
+     - 出场时由于 $P_1$ 上涨向 $P_2$ 归拢甚至超越 $P_2$，此时出场基差标量为 $(P_1 - P_2)/P_2$；
+     - 若出场时 $P_1$ 反超 $P_2$（正基差翻转），则超额部分进一步扩大了利润；
+     - **捕获基差公式**：
+       $$\Delta \text{Captured Basis} = \text{Entry Basis} + \text{Close Basis}$$
+     - *实战对账（Trade #2 WLD）*：开仓 $+1.0277\%$，平仓 $+0.6341\%$（反超翻转）：
+       $$\Delta = +1.0277\% + (+0.6341\%) = +1.6618\% = \mathbf{+166.2\text{ bps}}$$
+       毛利验证：$+1.6618\% \times \$668.14 \approx \$11.10$（理论最优报价毛利 `$11.53`），完全吻合！
+  4. **BPS 格式化**：
+     $$\text{Captured Basis (BPS)} = \Delta \text{Captured Basis} \times 10,000$$
+- **工程实现与三维全景透视**：
+  1. **底层策略引擎与状态持久化**（`v2_basis_stat_arb.py`）：
+     - 平仓撮合时自动计算 `captured_basis_pct`（保留 6 位小数）与 `captured_basis_bps`（保留 1 位小数）；
+     - 记录于 `record` 并落盘至 `basis_stat_arb_trades.json`，历史平仓数据一并补齐回填；
+     - 终端日志打印：`Basis Dynamics: 开仓 +0.53% ➔ 平仓 +0.03% | 实际捕获基差: +49.7 bps (+0.50%)`；
+  2. **前端看板卡片流与大表强化**（`basis_stat_arb_view.py`）：
+     - **卡片流头部徽章**：顶部快捷标签新增 `🎯 捕获基差: +49.7 bps`，一览即知；
+     - **收敛透视条核心高亮**：在渐变收敛条中央以醒目天蓝 monospace 徽章呈现 `🎯 实际捕获基差: +49.7 bps (+0.50%) (均值归拢收敛度 94.6%)`；
+     - **全维数据大表**：紧邻“平仓基差”和“理论毛价差”之间，无缝新增专属列 `实际捕获基差 (BPS)`，杜绝用户一切心算成本；
+     - **分析图表悬停增强**：收益爬升曲线 hover 交互提示中同步追加 `捕获基差: +XX.X bps`。
+- **质量验证与零破坏保障**：
+  - 更新单元测试 `test_closed_trade_card_html_content` 与 `test_closed_trades_table_captured_basis_column`，验证列顺序（平仓基差 ➔ 实际捕获基差 ➔ 理论毛价差）与卡片渲染准确度；
+  - `hummingbot-dashboard` 27 项基差测试 + 75 项全量测试 100% 通过；
+  - `hummingbot-api` 12 项测试 100% 通过。
