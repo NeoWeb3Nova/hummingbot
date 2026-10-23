@@ -56,9 +56,9 @@ class BasisStatArbitrageConfig(StrategyV2ConfigBase):
         json_schema_extra={"prompt": lambda mi: "Enter leverage (e.g. 3): ", "prompt_on_new": True}
     )
     min_entry_basis_pct: Decimal = Field(
-        default=Decimal("0.0070"),
+        default=Decimal("0.0050"),
         json_schema_extra={
-            "prompt": lambda mi: "Min absolute basis deviation to enter (e.g. 0.0070 for 0.70%): ",
+            "prompt": lambda mi: "Min absolute basis deviation to enter (e.g. 0.0050 for 0.50%): ",
             "prompt_on_new": True
         }
     )
@@ -162,9 +162,9 @@ class BasisStatArbitrageConfig(StrategyV2ConfigBase):
         }
     )
     min_executable_net_edge_pct: Decimal = Field(
-        default=Decimal("0.0030"),
+        default=Decimal("0.0018"),
         json_schema_extra={
-            "prompt": lambda mi: "Min executable VWAP net edge after taker fees and slippage (e.g. 0.0030 for 30 bps): ",
+            "prompt": lambda mi: "Min executable VWAP net edge after taker fees and slippage (e.g. 0.0018 for 18 bps): ",
             "prompt_on_new": True,
         }
     )
@@ -1124,7 +1124,7 @@ class BasisStatArbitrage(StrategyV2Base):
             total_friction_spread = roundtrip_taker_fees + roundtrip_latency + est_exit_depth_slip
             net_executable_edge = raw_vwap_basis - total_friction_spread
 
-            min_net_edge_limit = getattr(self.config, "min_executable_net_edge_pct", Decimal("0.0030"))
+            min_net_edge_limit = getattr(self.config, "min_executable_net_edge_pct", Decimal("0.0018"))
             if net_executable_edge < min_net_edge_limit:
                 self.logger().info(
                     f"🛡️ [LIQUIDITY-MIRAGE-INTERCEPT] Token '{token}' Net Executable Edge ({float(net_executable_edge):.3%}) "
@@ -1918,11 +1918,11 @@ class BasisStatArbitrage(StrategyV2Base):
                         net_edge = best_spread - taker_fees - latency_fees - slip_est
 
                         thresh = float(self.config.min_entry_basis_pct)
-                        min_edge_thresh = float(getattr(self.config, "min_executable_net_edge_pct", Decimal("0.0030")))
+                        min_edge_thresh = float(getattr(self.config, "min_executable_net_edge_pct", Decimal("0.0018")))
                         if min_top3 < min_order_sz:
                             status_str = f"🛡️ 流动性虚幻/拦截 (Top3: ${float(min_top3):,.0f})"
                         elif best_spread >= thresh and net_edge < min_edge_thresh:
-                            status_str = f"🛡️ 穿透拦截 (净利 {net_edge:+.2%} < 30bps)"
+                            status_str = f"🛡️ 穿透拦截 (净利 {net_edge:+.2%} < {min_edge_thresh*10000:.0f}bps)"
                         elif best_spread >= thresh:
                             dir_str = "Short C1/Long C2" if spread_sell1_buy2 >= spread_buy1_sell2 else "Long C1/Short C2"
                             status_str = f"⚡ 偏离超标 {best_spread:+.2%} ({dir_str})"
