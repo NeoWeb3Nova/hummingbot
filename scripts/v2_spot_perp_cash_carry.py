@@ -49,7 +49,7 @@ class SpotPerpCashCarryConfig(StrategyV2ConfigBase):
     position_size_quote: Decimal = Field(
         default=Decimal("1000.0"),
         json_schema_extra={
-            "prompt": lambda mi: "Enter position size in quote asset per leg (e.g. 1000.0 USD): ",
+            "prompt": lambda mi: "Enter default position size in quote asset per leg (e.g. 1000.0 USD): ",
             "prompt_on_new": True,
         }
     )
@@ -68,9 +68,9 @@ class SpotPerpCashCarryConfig(StrategyV2ConfigBase):
         }
     )
     min_entry_annualized_apr: Decimal = Field(
-        default=Decimal("0.25"),
+        default=Decimal("0.20"),
         json_schema_extra={
-            "prompt": lambda mi: "Min annualized funding APR to enter (e.g. 0.25 for 25% APR): ",
+            "prompt": lambda mi: "Min annualized funding APR to enter (e.g. 0.20 for 20% APR): ",
             "prompt_on_new": True,
         }
     )
@@ -88,48 +88,92 @@ class SpotPerpCashCarryConfig(StrategyV2ConfigBase):
             "prompt_on_new": False,
         }
     )
+
+    # --- Realistic Payback Horizon & Friction Allocation ---
     max_payback_hours: Decimal = Field(
-        default=Decimal("12.0"),
+        default=Decimal("72.0"),
         json_schema_extra={
-            "prompt": lambda mi: "Max hours of funding to recover roundtrip friction (e.g. 12.0): ",
+            "prompt": lambda mi: "Max hours of funding to recover roundtrip friction (e.g. 72.0): ",
             "prompt_on_new": True,
         }
     )
-    liquidation_buffer_pct: Decimal = Field(
-        default=Decimal("0.15"),
+    target_horizon_hours: Decimal = Field(
+        default=Decimal("336.0"),
         json_schema_extra={
-            "prompt": lambda mi: "Emergency buffer to Perp short liquidation price (e.g. 0.15 for 15%): ",
+            "prompt": lambda mi: "Target holding horizon in hours for cash & carry yield allocation (e.g. 336.0 for 14d): ",
             "prompt_on_new": False,
         }
     )
-    min_holding_seconds: int = Field(
-        default=3600,
+    max_friction_to_yield_ratio: Decimal = Field(
+        default=Decimal("0.30"),
         json_schema_extra={
-            "prompt": lambda mi: "Minimum holding time in seconds before normal decay exit (e.g. 3600 for 1h): ",
+            "prompt": lambda mi: "Max allowable ratio of entry friction over expected horizon yield (e.g. 0.30 for 30%): ",
             "prompt_on_new": False,
         }
     )
-    max_hold_hours: float = Field(
-        default=168.0,
-        json_schema_extra={
-            "prompt": lambda mi: "Maximum holding time in hours before rebalance (e.g. 168.0 for 7d): ",
-            "prompt_on_new": False,
-        }
+
+    # --- Multi-Tier Asset Classification Matrix ---
+    tier_1_tokens: List[str] = Field(
+        default=["BTC", "ETH", "SOL"],
+        json_schema_extra={"prompt": lambda mi: "Tier 1 mega-cap tokens: ", "prompt_on_new": False}
     )
+    tier_1_max_quote: Decimal = Field(default=Decimal("5000.0"))
+    tier_1_min_apr: Decimal = Field(default=Decimal("0.12"))
+    tier_1_liquidation_buffer: Decimal = Field(default=Decimal("0.08"))
+
+    tier_2_tokens: List[str] = Field(
+        default=[
+            "AVAX", "SUI", "APT", "NEAR", "LINK", "ARB", "OP", "INJ",
+            "DOGE", "XRP", "ADA", "DOT", "UNI", "LTC", "BCH", "BNB"
+        ],
+        json_schema_extra={"prompt": lambda mi: "Tier 2 large/mid-cap tokens: ", "prompt_on_new": False}
+    )
+    tier_2_max_quote: Decimal = Field(default=Decimal("2000.0"))
+    tier_2_min_apr: Decimal = Field(default=Decimal("0.18"))
+    tier_2_liquidation_buffer: Decimal = Field(default=Decimal("0.12"))
+
+    tier_3_max_quote: Decimal = Field(default=Decimal("500.0"))
+    tier_3_min_apr: Decimal = Field(default=Decimal("0.25"))
+    tier_3_liquidation_buffer: Decimal = Field(default=Decimal("0.16"))
+
+    # --- Dynamic Order Book Depth Sizing ---
+    dynamic_position_sizing: bool = Field(default=True)
+    max_orderbook_depth_ratio: Decimal = Field(default=Decimal("0.20"))
+    min_position_size_quote: Decimal = Field(default=Decimal("100.0"))
+
+    # --- Hourly Micro-Blackout Window (:58 ~ :01) ---
+    hourly_blackout_enabled: bool = Field(default=True)
+    hourly_blackout_start_minute: int = Field(default=58, ge=0, le=59)
+    hourly_blackout_end_minute: int = Field(default=1, ge=0, le=59)
+
+    # --- Breakeven Trailing Stop & Tranche Take-Profit ---
+    breakeven_trailing_enabled: bool = Field(default=True)
+    breakeven_trailing_activation_pct: Decimal = Field(default=Decimal("0.008"))
+    breakeven_trailing_stop_pct: Decimal = Field(default=Decimal("0.002"))
+    scaling_tp_enabled: bool = Field(default=True)
+    partial_tp_ratio: Decimal = Field(default=Decimal("0.50"))
+    partial_tp_threshold_pct: Decimal = Field(default=Decimal("0.015"))
+
+    # --- Toxic Token Quarantine & Risk Controls ---
+    token_quarantine_hours: float = Field(default=24.0)
+    single_loss_quarantine_threshold: Decimal = Field(default=Decimal("10.0"))
+    liquidation_buffer_pct: Decimal = Field(default=Decimal("0.15"))
+    min_holding_seconds: int = Field(default=3600)
+    max_hold_hours: float = Field(default=168.0)
     entry_persistence_ticks: int = Field(default=2, ge=1)
     exit_persistence_ticks: int = Field(default=2, ge=1)
     auto_rotation_enabled: bool = Field(default=True)
     auto_rotation_interval_minutes: float = Field(default=3.0, ge=0.5)
     auto_rotation_min_delta_apr: Decimal = Field(default=Decimal("0.20"))
-    min_order_book_depth_quote: Decimal = Field(default=Decimal("3000.0"))
+    min_order_book_depth_quote: Decimal = Field(default=Decimal("1000.0"))
     spot_taker_fee_rate: Decimal = Field(default=Decimal("0.0010"))
     perp_taker_fee_rate: Decimal = Field(default=Decimal("0.00035"))
     simulated_latency_slippage_pct: Decimal = Field(default=Decimal("0.0002"))
     dry_run: bool = Field(default=True)
-    dry_run_virtual_spot_quote: Decimal = Field(default=Decimal("3000.0"))
-    dry_run_virtual_perp_quote: Decimal = Field(default=Decimal("1500.0"))
+    dry_run_virtual_spot_quote: Decimal = Field(default=Decimal("5000.0"))
+    dry_run_virtual_perp_quote: Decimal = Field(default=Decimal("2500.0"))
 
-    @field_validator("tokens", mode="before")
+    @field_validator("tokens", "tier_1_tokens", "tier_2_tokens", mode="before")
     def validate_tokens(cls, v):
         if isinstance(v, str):
             return [val.strip().upper() for val in v.split(",") if val.strip()]
@@ -143,6 +187,12 @@ class SpotPerpCashCarryStrategy(StrategyV2Base):
     Spot-Perp Cash & Carry Quantitative Yield Harvesting Engine.
     Pairs Binance Spot (Long physical coin) with Hyperliquid Perpetual (Short contract).
     Harvests continuous 1-hour funding cashflows with physical spot delivery anchor.
+    Features:
+    - Realistic 48h payback ceiling & Contango basis surplus offset.
+    - Tier-1/2/3 multi-tier asset matrix & dynamic order book depth sizing.
+    - Hourly micro-blackout window (:58 ~ :01) protecting against funding settlement volatility.
+    - Breakeven trailing stop & scaling-out tranche take profit.
+    - Single-leg (Perp Short) liquidation cushion defense & toxic token quarantine.
     """
 
     _logger: Optional[logging.Logger] = None
@@ -229,6 +279,7 @@ class SpotPerpCashCarryStrategy(StrategyV2Base):
         self.entry_candidate_ticks: Dict[str, int] = {}
         self.exit_candidate_ticks: Dict[str, int] = {}
         self.token_last_closed_ts: Dict[str, float] = {}
+        self.token_quarantine_until: Dict[str, float] = {}
         self.token_admitted_at: Dict[str, float] = {tok: time.time() for tok in self.config.tokens}
 
         # Dynamic Universe Rotation & Hot-Swap
@@ -238,6 +289,7 @@ class SpotPerpCashCarryStrategy(StrategyV2Base):
         self._rotation_in_progress = False
         self._last_rotation_check_ts = 0.0
         self._last_candidates_scan_ts = 0.0
+        self._last_telemetry_log_ts = 0.0
 
         # Set leverage and position mode on Perp connector for live trading
         if not self.config.dry_run:
@@ -280,7 +332,13 @@ class SpotPerpCashCarryStrategy(StrategyV2Base):
         # 2. Dynamic universe background scan & rotation
         self.check_universe_rotation()
 
-        # 3. Publish real-time status and telemetry
+        # 3. Evaluate entry proposals (Long Spot + Short Perp)
+        self.create_actions_proposal()
+
+        # 4. Evaluate exit proposals (Sell Spot + Buy to Close Perp Short)
+        self.stop_actions_proposal()
+
+        # 5. Publish real-time status and telemetry
         self.publish_performance_report()
 
         duration_ms = (time.perf_counter() - t0) * 1000.0
@@ -291,6 +349,100 @@ class SpotPerpCashCarryStrategy(StrategyV2Base):
         if "hyperliquid" in connector_name:
             return f"{token}-USD"
         return f"{token}-USDT"
+
+    # =========================================================================
+    # Multi-Tier Asset Classification & Risk Controls
+    # =========================================================================
+
+    def get_token_tier(self, token: str) -> int:
+        """Classify token into Tier 1 (Mega), Tier 2 (Mid/Large), or Tier 3 (Alt/Meme)."""
+        tok_up = token.upper()
+        if tok_up in self.config.tier_1_tokens:
+            return 1
+        if tok_up in self.config.tier_2_tokens:
+            return 2
+        return 3
+
+    def get_tier_config(self, token: str) -> Tuple[Decimal, Decimal, Decimal]:
+        """Returns (max_quote_size, min_apr, liquidation_buffer) for token's tier."""
+        tier = self.get_token_tier(token)
+        if tier == 1:
+            return self.config.tier_1_max_quote, self.config.tier_1_min_apr, self.config.tier_1_liquidation_buffer
+        if tier == 2:
+            return self.config.tier_2_max_quote, self.config.tier_2_min_apr, self.config.tier_2_liquidation_buffer
+        return self.config.tier_3_max_quote, self.config.tier_3_min_apr, self.config.tier_3_liquidation_buffer
+
+    def is_in_hourly_blackout(self) -> bool:
+        """Returns True if current time falls within hourly funding payment blackout window (:58 ~ :01)."""
+        if not self.config.hourly_blackout_enabled:
+            return False
+        dt = datetime.fromtimestamp(self.current_timestamp, tz=timezone.utc)
+        minute = dt.minute
+        start_m = self.config.hourly_blackout_start_minute
+        end_m = self.config.hourly_blackout_end_minute
+        if start_m <= end_m:
+            return start_m <= minute <= end_m
+        return minute >= start_m or minute <= end_m
+
+    def is_token_quarantined(self, token: str) -> bool:
+        """Check if toxic token is currently cooling down in quarantine."""
+        until = self.token_quarantine_until.get(token, 0.0)
+        return self.current_timestamp < until
+
+    def quarantine_token(self, token: str, hours: float, reason: str):
+        """Put toxic token into quarantine cooldown."""
+        self.token_quarantine_until[token] = self.current_timestamp + (hours * 3600.0)
+        self.logger().warning(
+            f"🚫 [QUARANTINE] Token '{token}' quarantined for {hours:.1f}h! Reason: {reason}"
+        )
+
+    def calculate_position_size(self, token: str, depth_spot: Decimal, depth_perp: Decimal) -> Decimal:
+        """Computes dynamic position sizing based on tier limits and safe order book depth."""
+        tier_max, _, _ = self.get_tier_config(token)
+        base_size = min(self.config.position_size_quote, tier_max)
+        if not self.config.dynamic_position_sizing:
+            return base_size
+
+        min_depth = min(depth_spot, depth_perp)
+        safe_capacity = min_depth * self.config.max_orderbook_depth_ratio
+        target = min(tier_max, safe_capacity)
+        return max(self.config.min_position_size_quote, target)
+
+    def calculate_friction_and_payback(
+        self, p_spot_exec: Decimal, p_perp_exec: Decimal,
+        p_spot_slip: Optional[Decimal], p_perp_slip: Optional[Decimal],
+        rate_1h: Decimal
+    ) -> Tuple[Decimal, Decimal, Decimal, bool]:
+        """
+        Calculates:
+        - basis_spread: (p_perp - p_spot) / p_spot
+        - total_friction: spot fees + perp fees + latency + slippage
+        - payback_hours: hours of funding to recover friction
+        - is_acceptable: True if meets either payback_hours <= max_payback_hours OR friction-to-yield ratio <= max_friction_to_yield_ratio
+        """
+        basis_spread = (p_perp_exec - p_spot_exec) / p_spot_exec
+        roundtrip_fees = (self.config.spot_taker_fee_rate * Decimal("2.0")) + (self.config.perp_taker_fee_rate * Decimal("2.0"))
+        roundtrip_latency = self.config.simulated_latency_slippage_pct * Decimal("4.0")
+        est_slippage = (p_spot_slip or Decimal("0")) + (p_perp_slip or Decimal("0"))
+        total_friction = roundtrip_fees + roundtrip_latency + (est_slippage * Decimal("2.0"))
+
+        # Net hurdle: If Perp > Spot (Contango), basis surplus directly offsets friction!
+        net_hurdle = total_friction - basis_spread
+
+        if net_hurdle <= Decimal("0"):
+            # Basis surplus alone fully pays for all roundtrip friction!
+            payback_hours = Decimal("0.0")
+            is_acceptable = True
+        elif rate_1h > Decimal("0"):
+            payback_hours = net_hurdle / rate_1h
+            expected_funding = rate_1h * self.config.target_horizon_hours
+            friction_ratio = net_hurdle / expected_funding if expected_funding > Decimal("0") else Decimal("999.0")
+            is_acceptable = (payback_hours <= self.config.max_payback_hours) or (friction_ratio <= self.config.max_friction_to_yield_ratio)
+        else:
+            payback_hours = Decimal("999.0")
+            is_acceptable = False
+
+        return basis_spread, total_friction, payback_hours, is_acceptable
 
     # =========================================================================
     # Discrete Funding Settlement Engine (Hyperliquid 1h Ledger)
@@ -350,6 +502,10 @@ class SpotPerpCashCarryStrategy(StrategyV2Base):
         if len(self.active_positions) >= self.config.max_concurrent_tokens:
             return []
 
+        # 1. Hourly Blackout Window Check (:58 ~ :01)
+        if self.is_in_hourly_blackout():
+            return []
+
         c_spot = self.config.spot_connector
         c_perp = self.config.perp_connector
         conn_spot = self.connectors.get(c_spot)
@@ -362,26 +518,17 @@ class SpotPerpCashCarryStrategy(StrategyV2Base):
         if available_slots <= 0:
             return []
 
-        # Margin and capital pre-flight verification
-        pos_size = self.config.position_size_quote
-        spot_req = pos_size * (Decimal("1.0") + self.config.spot_taker_fee_rate)
-        perp_req = (pos_size / Decimal(str(self.config.perp_leverage))) * Decimal("1.20")
-
-        if self.config.dry_run:
-            used_spot = sum(Decimal(str(p.get("position_size", 0.0))) for p in self.active_positions.values())
-            used_perp = sum(Decimal(str(p.get("perp_margin", 0.0))) for p in self.active_positions.values())
-            avail_spot = self.config.dry_run_virtual_spot_quote - used_spot
-            avail_perp = self.config.dry_run_virtual_perp_quote - used_perp
-            if avail_spot < spot_req or avail_perp < perp_req:
-                return []
-
         for token in self.config.tokens:
+            if len(self.active_positions) >= self.config.max_concurrent_tokens:
+                break
             if token in self.active_positions:
                 continue
 
-            # Anti-churn cooldown (300s after last close)
+            # Anti-churn cooldown & Quarantine checks
             last_close = self.token_last_closed_ts.get(token, 0.0)
             if self.current_timestamp - last_close < 300.0:
+                continue
+            if self.is_token_quarantined(token):
                 continue
 
             tp_spot = self.get_trading_pair_for_connector(token, c_spot)
@@ -390,7 +537,7 @@ class SpotPerpCashCarryStrategy(StrategyV2Base):
             if not conn_spot.order_book_tracker.ready or not conn_perp.order_book_tracker.ready:
                 continue
 
-            # 1. Query Hyperliquid Perpetual funding info & calculate annualized APR
+            # 2. Query Hyperliquid Perpetual funding info & calculate annualized APR
             f_info = conn_perp.get_funding_info(tp_perp)
             if not f_info:
                 continue
@@ -402,14 +549,34 @@ class SpotPerpCashCarryStrategy(StrategyV2Base):
             daily_rate = rate_1h * Decimal("24")
             annual_apr = daily_rate * Decimal("365")
 
-            # Entry threshold: must meet min_entry_annualized_apr
-            if annual_apr < self.config.min_entry_annualized_apr:
+            # Entry threshold: must meet tier-specific min_apr
+            tier_max_quote, tier_min_apr, tier_liq_buffer = self.get_tier_config(token)
+            eff_min_apr = max(tier_min_apr, self.config.min_entry_annualized_apr)
+            if annual_apr < eff_min_apr:
                 self.entry_candidate_ticks[token] = 0
                 continue
 
-            # 2. Query execution orderbooks:
-            # Spot Leg: Buy at Ask
-            # Perp Leg: Sell at Bid
+            # 3. Liquidity Depth Gate & Dynamic Sizing
+            depth_spot = self.get_top_depth_quote(c_spot, tp_spot, is_buy=True, levels=25)
+            depth_perp = self.get_top_depth_quote(c_perp, tp_perp, is_buy=False, levels=25)
+            if depth_spot < self.config.min_order_book_depth_quote or depth_perp < self.config.min_order_book_depth_quote:
+                self.entry_candidate_ticks[token] = 0
+                continue
+
+            pos_size = self.calculate_position_size(token, depth_spot, depth_perp)
+
+            # Pre-flight virtual margin verification
+            spot_req = pos_size * (Decimal("1.0") + self.config.spot_taker_fee_rate)
+            perp_req = (pos_size / Decimal(str(self.config.perp_leverage))) * Decimal("1.20")
+            if self.config.dry_run:
+                used_spot = sum(Decimal(str(p.get("position_size", 0.0))) for p in self.active_positions.values())
+                used_perp = sum(Decimal(str(p.get("perp_margin", 0.0))) for p in self.active_positions.values())
+                avail_spot = self.config.dry_run_virtual_spot_quote - used_spot
+                avail_perp = self.config.dry_run_virtual_perp_quote - used_perp
+                if avail_spot < spot_req or avail_perp < perp_req:
+                    continue
+
+            # 4. Query execution orderbooks with dynamically calculated size
             p_spot_best, p_spot_vwap, p_spot_exec, p_spot_slip = self.get_orderbook_execution_metrics(
                 c_spot, tp_spot, is_buy=True, quote_volume=pos_size
             )
@@ -421,53 +588,35 @@ class SpotPerpCashCarryStrategy(StrategyV2Base):
                 self.entry_candidate_ticks[token] = 0
                 continue
 
-            # 3. Liquidity Depth Gate
-            depth_spot = self.get_top_depth_quote(c_spot, tp_spot, is_buy=True)
-            depth_perp = self.get_top_depth_quote(c_perp, tp_perp, is_buy=False)
-            if depth_spot < self.config.min_order_book_depth_quote or depth_perp < self.config.min_order_book_depth_quote:
+            # 5. Entry Basis & Payback Period Barrier
+            basis_spread, total_friction, payback_hours, is_payback_ok = self.calculate_friction_and_payback(
+                p_spot_exec, p_perp_exec, p_spot_slip, p_perp_slip, rate_1h
+            )
+
+            if not is_payback_ok:
                 self.entry_candidate_ticks[token] = 0
                 continue
 
-            # 4. Entry Basis & Payback Period Barrier
-            # Spot buy price vs Perp short price
-            basis_spread = (p_perp_exec - p_spot_exec) / p_spot_exec
-            roundtrip_fees = (self.config.spot_taker_fee_rate * Decimal("2.0")) + (self.config.perp_taker_fee_rate * Decimal("2.0"))
-            roundtrip_latency = self.config.simulated_latency_slippage_pct * Decimal("4.0")
-            est_slippage = (p_spot_slip or Decimal("0")) + (p_perp_slip or Decimal("0"))
-            total_friction = roundtrip_fees + roundtrip_latency + (est_slippage * Decimal("2.0"))
-
-            # Payback calculation:
-            # If basis is positive (Perp > Spot), basis surplus helps cover friction!
-            # Net hurdle to recover = total_friction - basis_spread
-            net_hurdle = max(Decimal("0.0001"), total_friction - basis_spread)
-            payback_hours = net_hurdle / rate_1h if rate_1h > Decimal("0") else Decimal("999.0")
-
-            if payback_hours > self.config.max_payback_hours:
-                self.entry_candidate_ticks[token] = 0
-                continue
-
-            # 5. Persistence confirmation ticks (prevent momentary spikes)
+            # 6. Persistence confirmation ticks (prevent momentary spikes)
             self.entry_candidate_ticks[token] = self.entry_candidate_ticks.get(token, 0) + 1
             if self.entry_candidate_ticks[token] < self.config.entry_persistence_ticks:
                 self.logger().info(
-                    f"⚡ [SPOT-PERP-PULSE] Token '{token}' APR {float(annual_apr):+.1%} "
+                    f"⚡ [SPOT-PERP-PULSE] Token '{token}' (Tier {self.get_token_tier(token)}) APR {float(annual_apr):+.1%} "
                     f"({self.entry_candidate_ticks[token]}/{self.config.entry_persistence_ticks} ticks). "
                     f"Spot Ask ${float(p_spot_exec):.4f} / Perp Bid ${float(p_perp_exec):.4f} "
-                    f"(Basis {float(basis_spread):+.2%}, Payback: {float(payback_hours):.1f}h)."
+                    f"(Basis {float(basis_spread):+.2%}, Payback: {float(payback_hours):.1f}h, Size: ${float(pos_size):,.0f})."
                 )
                 continue
 
-            # 6. Execute Entry
+            # 7. Execute Entry
             coin_amount = pos_size / p_spot_exec
             perp_margin = pos_size / Decimal(str(self.config.perp_leverage))
             total_capital = pos_size + perp_margin
-
-            # Estimated liquidation price on Hyperliquid 3x short
-            # Liq price = entry_price * (1 + 1/leverage - 0.03 maint_margin)
             est_liq_price = p_perp_exec * (Decimal("1.0") + (Decimal("1.0") / Decimal(str(self.config.perp_leverage))) - Decimal("0.03"))
 
             pos_data = {
                 "token": token,
+                "tier": self.get_token_tier(token),
                 "is_virtual": self.config.dry_run,
                 "spot_connector": c_spot,
                 "perp_connector": c_perp,
@@ -484,20 +633,24 @@ class SpotPerpCashCarryStrategy(StrategyV2Base):
                 "perp_margin": float(perp_margin),
                 "total_margin": float(total_capital),
                 "estimated_liq_price": float(est_liq_price),
+                "tier_liq_buffer": float(tier_liq_buffer),
                 "open_timestamp": self.current_timestamp,
                 "settled_funding_pnl": 0.0,
                 "funding_payments": [],
                 "next_funding_time": int(self.current_timestamp + 3600),
+                "peak_roe_pct": 0.0,
+                "breakeven_active": False,
+                "partial_tp_done": False,
             }
 
             self.active_positions[token] = pos_data
             self.entry_candidate_ticks[token] = 0
             self.logger().info(
-                f"🚀 [SPOT-PERP-ENTRY-TRIGGER] Token '{token}' Cash & Carry Activated!\n"
+                f"🚀 [SPOT-PERP-ENTRY-TRIGGER] Token '{token}' (Tier {pos_data['tier']}) Cash & Carry Activated!\n"
                 f"  Leg 1 (Spot {c_spot}): BUY {float(coin_amount):,.4f} {token} @ ${float(p_spot_exec):.4f} (Notional ${float(pos_size):,.2f})\n"
                 f"  Leg 2 (Perp {c_perp}): SHORT {float(coin_amount):,.4f} {token} @ ${float(p_perp_exec):.4f} (Margin ${float(perp_margin):,.2f}, {self.config.perp_leverage}x)\n"
                 f"  Funding Yield: Annualized APR {float(annual_apr):+.1%} (Daily {float(daily_rate):+.2%})\n"
-                f"  Friction & Payback: Payback {float(payback_hours):.1f}h (Basis: {float(basis_spread):+.2%}, Liq Price: ${float(est_liq_price):.4f})"
+                f"  Friction & Payback: Payback {float(payback_hours):.1f}h (Basis: {float(basis_spread):+.2%}, Liq Price: ${float(est_liq_price):.4f}, Buffer: {float(tier_liq_buffer):.1%})"
             )
             self._persist_state()
 
@@ -539,6 +692,8 @@ class SpotPerpCashCarryStrategy(StrategyV2Base):
             # Query live funding APR
             f_info = conn_perp.get_funding_info(tp_perp) if conn_perp else None
             rate_1h = Decimal(str(f_info.rate)) if f_info else Decimal("0")
+            if abs(rate_1h) > Decimal("0.5"):
+                rate_1h = Decimal("0.0001")
             curr_apr = rate_1h * Decimal("24") * Decimal("365")
 
             # Financial PnL attribution
@@ -568,9 +723,17 @@ class SpotPerpCashCarryStrategy(StrategyV2Base):
             total_capital = Decimal(str(pos.get("total_margin", pos_size * Decimal("1.333"))))
             roe_pct = total_net_pnl / total_capital if total_capital > Decimal("0") else Decimal("0")
 
-            # Liquidation safety cushion on Hyperliquid
+            # Liquidation safety cushion on Hyperliquid (Short leg only)
             est_liq = Decimal(str(pos.get("estimated_liq_price", p_perp_entry * Decimal("1.30"))))
             safety_cushion_pct = (est_liq - p_perp_exec) / p_perp_exec if p_perp_exec > Decimal("0") else Decimal("0")
+            tier_liq_buf = Decimal(str(pos.get("tier_liq_buffer", self.config.liquidation_buffer_pct)))
+
+            # Breakeven Trailing Update
+            peak_roe = max(Decimal(str(pos.get("peak_roe_pct", 0.0))), roe_pct)
+            pos["peak_roe_pct"] = float(peak_roe)
+            if self.config.breakeven_trailing_enabled:
+                if roe_pct >= self.config.breakeven_trailing_activation_pct:
+                    pos["breakeven_active"] = True
 
             # Update live position in-place
             pos["current_spot_price"] = float(p_spot_exec)
@@ -582,6 +745,77 @@ class SpotPerpCashCarryStrategy(StrategyV2Base):
             pos["roe_pct"] = float(roe_pct)
             pos["duration_seconds"] = int(duration_s)
 
+            # ----------------- Scaling-Out Take Profit Check -----------------
+            if (self.config.scaling_tp_enabled and
+                not pos.get("partial_tp_done", False) and
+                roe_pct >= self.config.partial_tp_threshold_pct and
+                duration_s >= self.config.min_holding_seconds):
+
+                ratio = self.config.partial_tp_ratio
+                closed_coin_amt = coin_amt * ratio
+                rem_coin_amt = coin_amt - closed_coin_amt
+
+                part_spot_pnl = (p_spot_exec - p_spot_entry) * closed_coin_amt
+                part_perp_pnl = (p_perp_entry - p_perp_exec) * closed_coin_amt
+                part_trading_pnl = part_spot_pnl + part_perp_pnl
+                part_friction = total_friction * ratio
+                part_settled_funding = settled_funding * ratio
+                part_net_pnl = part_trading_pnl - part_friction + part_settled_funding
+                part_capital = total_capital * ratio
+
+                self.logger().info(
+                    f"🎯 [SPOT-PERP-PARTIAL-TP] Token '{token}' locked {float(ratio):.0%} tranche profit!\n"
+                    f"  Partial Net PnL: ${float(part_net_pnl):+,.2f} USD (ROE {float(roe_pct):+.2%})\n"
+                    f"  Remaining Position: {float(rem_coin_amt):,.4f} {token} (${float(pos_size * (Decimal('1') - ratio)):,.2f}) continues harvesting."
+                )
+
+                record = {
+                    "token": token,
+                    "tier": pos.get("tier", self.get_token_tier(token)),
+                    "spot_connector": pos["spot_connector"],
+                    "perp_connector": pos["perp_connector"],
+                    "amount": float(closed_coin_amt),
+                    "position_size": float(pos_size * ratio),
+                    "perp_leverage": pos["perp_leverage"],
+                    "spot_entry_price": pos["spot_entry_price"],
+                    "perp_entry_price": pos["perp_entry_price"],
+                    "spot_close_price": float(p_spot_exec),
+                    "perp_close_price": float(p_perp_exec),
+                    "entry_basis_pct": pos["entry_basis_pct"],
+                    "close_basis_pct": float((p_perp_exec - p_spot_exec) / p_spot_exec),
+                    "entry_apr": pos["entry_apr"],
+                    "spot_margin": float(pos["spot_margin"] * float(ratio)),
+                    "perp_margin": float(pos["perp_margin"] * float(ratio)),
+                    "total_margin": float(part_capital),
+                    "spot_pnl": float(part_spot_pnl),
+                    "perp_pnl": float(part_perp_pnl),
+                    "trading_pnl": float(part_trading_pnl),
+                    "total_friction_cost": float(part_friction),
+                    "net_trading_pnl": float(part_trading_pnl - part_friction),
+                    "settled_funding_pnl": float(part_settled_funding),
+                    "funding_payments": pos.get("funding_payments", []),
+                    "settlement_count": len(pos.get("funding_payments", [])),
+                    "total_net_pnl": float(part_net_pnl),
+                    "roe_pct": float(roe_pct),
+                    "close_reason": f"Partial Scaling Take-Profit ({float(ratio):.0%})",
+                    "open_timestamp": pos["open_timestamp"],
+                    "close_timestamp": self.current_timestamp,
+                    "duration_seconds": int(duration_s),
+                }
+                if token not in self.closed_trades:
+                    self.closed_trades[token] = []
+                self.closed_trades[token].append(record)
+
+                pos["amount"] = float(rem_coin_amt)
+                pos["position_size"] = float(pos_size * (Decimal("1") - ratio))
+                pos["spot_margin"] = float(pos["spot_margin"] * float(Decimal("1") - ratio))
+                pos["perp_margin"] = float(pos["perp_margin"] * float(Decimal("1") - ratio))
+                pos["total_margin"] = float(total_capital * (Decimal("1") - ratio))
+                pos["settled_funding_pnl"] = float(settled_funding * (Decimal("1") - ratio))
+                pos["partial_tp_done"] = True
+                self._persist_state()
+                continue
+
             # ----------------- Exit Conditions -----------------
             # 1. Rate Inversion Stop (funding turned negative)
             is_inverted = curr_apr <= self.config.inversion_exit_apr
@@ -589,13 +823,20 @@ class SpotPerpCashCarryStrategy(StrategyV2Base):
             # 2. Funding Yield Decay Exit (APR dropped below exit threshold & min holding passed)
             is_decayed = (curr_apr < self.config.exit_annualized_apr) and (duration_s >= self.config.min_holding_seconds)
 
-            # 3. Emergency Liquidation Cushion Breach
-            is_liq_danger = safety_cushion_pct <= self.config.liquidation_buffer_pct
+            # 3. Emergency Liquidation Cushion Breach (Perp short leg)
+            is_liq_danger = safety_cushion_pct <= tier_liq_buf
 
-            # 4. Max Duration Timeout Expiry
+            # 4. Breakeven Trailing Stop Loss
+            is_breakeven_stop = (
+                pos.get("breakeven_active", False) and
+                roe_pct < self.config.breakeven_trailing_stop_pct and
+                duration_s >= self.config.min_holding_seconds
+            )
+
+            # 5. Max Duration Timeout Expiry
             is_timeout = (duration_h >= self.config.max_hold_hours) and (total_net_pnl >= Decimal("0"))
 
-            should_exit = is_inverted or is_decayed or is_liq_danger or is_timeout
+            should_exit = is_inverted or is_decayed or is_liq_danger or is_breakeven_stop or is_timeout
             if should_exit:
                 self.exit_candidate_ticks[token] = self.exit_candidate_ticks.get(token, 0) + 1
             else:
@@ -603,7 +844,9 @@ class SpotPerpCashCarryStrategy(StrategyV2Base):
 
             if self.exit_candidate_ticks.get(token, 0) >= self.config.exit_persistence_ticks:
                 if is_liq_danger:
-                    reason = f"Liquidation Defense Exit (Cushion {float(safety_cushion_pct):.1%} <= {float(self.config.liquidation_buffer_pct):.1%})"
+                    reason = f"Liquidation Defense Exit (Cushion {float(safety_cushion_pct):.1%} <= {float(tier_liq_buf):.1%})"
+                elif is_breakeven_stop:
+                    reason = f"Breakeven Trailing Stop Exit (ROE {float(roe_pct):+.2%} < {float(self.config.breakeven_trailing_stop_pct):+.2%})"
                 elif is_inverted:
                     reason = f"Funding Rate Inversion Exit (APR {float(curr_apr):+.1%} <= 0%)"
                 elif is_decayed:
@@ -616,6 +859,7 @@ class SpotPerpCashCarryStrategy(StrategyV2Base):
                 tokens_to_close.append({
                     "token": token,
                     "reason": reason,
+                    "is_liq_danger": is_liq_danger,
                     "spot_close_price": float(p_spot_exec),
                     "perp_close_price": float(p_perp_exec),
                     "spot_pnl": float(spot_pnl),
@@ -634,8 +878,13 @@ class SpotPerpCashCarryStrategy(StrategyV2Base):
             pos = self.active_positions.pop(token)
             self.token_last_closed_ts[token] = self.current_timestamp
 
+            # Quarantine toxic token if liquidated or heavy loss
+            if item["is_liq_danger"] or item["total_net_pnl"] < -float(self.config.single_loss_quarantine_threshold):
+                self.quarantine_token(token, self.config.token_quarantine_hours, item["reason"])
+
             record = {
                 "token": token,
+                "tier": pos.get("tier", self.get_token_tier(token)),
                 "spot_connector": pos["spot_connector"],
                 "perp_connector": pos["perp_connector"],
                 "amount": pos["amount"],
@@ -706,7 +955,7 @@ class SpotPerpCashCarryStrategy(StrategyV2Base):
             return
 
         candidates = []
-        pos_size = self.config.position_size_quote
+        is_blackout = self.is_in_hourly_blackout()
 
         for tok in self.config.tokens:
             tp_spot = self.get_trading_pair_for_connector(tok, c_spot)
@@ -723,26 +972,48 @@ class SpotPerpCashCarryStrategy(StrategyV2Base):
                 p_perp = self.get_price_from_orderbook(c_perp, tp_perp, is_buy=False)
                 basis = (p_perp - p_spot) / p_spot if p_spot and p_perp else Decimal("0")
 
-                depth_spot = self.get_top_depth_quote(c_spot, tp_spot, is_buy=True)
-                depth_perp = self.get_top_depth_quote(c_perp, tp_perp, is_buy=False)
+                depth_spot = self.get_top_depth_quote(c_spot, tp_spot, is_buy=True, levels=25)
+                depth_perp = self.get_top_depth_quote(c_perp, tp_perp, is_buy=False, levels=25)
 
-                roundtrip_friction = (self.config.spot_taker_fee_rate * Decimal("2.0")) + (self.config.perp_taker_fee_rate * Decimal("2.0"))
-                net_hurdle = max(Decimal("0.0001"), roundtrip_friction - basis)
-                payback_h = net_hurdle / rate_1h if rate_1h > Decimal("0") else Decimal("999.0")
+                tier = self.get_token_tier(tok)
+                tier_max_quote, tier_min_apr, tier_liq_buf = self.get_tier_config(tok)
+                safe_size = self.calculate_position_size(tok, depth_spot, depth_perp)
+
+                if p_spot and p_perp:
+                    basis_spread, total_friction, payback_h, is_payback_ok = self.calculate_friction_and_payback(
+                        p_spot, p_perp, None, None, rate_1h
+                    )
+                else:
+                    basis_spread, total_friction, payback_h, is_payback_ok = basis, Decimal("0.0035"), Decimal("999.0"), False
 
                 is_active = tok in self.active_positions
+                is_quarantined = self.is_token_quarantined(tok)
+
+                if is_active:
+                    status = "In Position"
+                elif is_quarantined:
+                    status = "Quarantined"
+                elif is_blackout:
+                    status = "Hourly Blackout"
+                elif is_payback_ok and annual_apr >= max(tier_min_apr, self.config.min_entry_annualized_apr):
+                    status = "Eligible"
+                else:
+                    status = "Standby"
+
                 candidates.append({
                     "token": tok,
+                    "tier": tier,
                     "annual_apr": float(annual_apr),
                     "hourly_rate": float(rate_1h),
                     "spot_price": float(p_spot) if p_spot else 0.0,
                     "perp_price": float(p_perp) if p_perp else 0.0,
                     "basis_pct": float(basis),
                     "payback_hours": float(payback_h),
+                    "safe_capacity": float(safe_size),
                     "depth_spot": float(depth_spot),
                     "depth_perp": float(depth_perp),
                     "is_active": is_active,
-                    "status": "In Position" if is_active else ("Eligible" if annual_apr >= self.config.min_entry_annualized_apr and payback_h <= self.config.max_payback_hours else "Standby")
+                    "status": status,
                 })
             except Exception as e:
                 import traceback
@@ -758,7 +1029,6 @@ class SpotPerpCashCarryStrategy(StrategyV2Base):
             self._last_rotation_check_ts = now
             top_standby = next((c for c in candidates if not c["is_active"] and c["status"] == "Eligible"), None)
             if top_standby:
-                # Find lowest active APR token
                 active_tokens_info = [
                     (tok, pos.get("current_apr", pos.get("entry_apr", 0.0)))
                     for tok, pos in self.active_positions.items()
@@ -778,7 +1048,6 @@ class SpotPerpCashCarryStrategy(StrategyV2Base):
                         "admitted_token": top_standby["token"],
                         "admitted_apr": top_standby["annual_apr"],
                     })
-                    # Force exit of lowest token
                     self.exit_candidate_ticks[lowest_tok] = 999
 
     # =========================================================================
@@ -854,8 +1123,8 @@ class SpotPerpCashCarryStrategy(StrategyV2Base):
         except Exception:
             return best_price, best_price, best_price, Decimal("0")
 
-    def get_top_depth_quote(self, connector_name: str, trading_pair: str, is_buy: bool, levels: int = 5) -> Decimal:
-        """Calculate cumulative quote volume in top N levels."""
+    def get_top_depth_quote(self, connector_name: str, trading_pair: str, is_buy: bool, levels: int = 25) -> Decimal:
+        """Calculate cumulative quote volume in top N levels (default 25 levels)."""
         connector = self.connectors.get(connector_name)
         if not connector:
             return Decimal("0")
@@ -894,11 +1163,13 @@ class SpotPerpCashCarryStrategy(StrategyV2Base):
             "max_concurrent_tokens": self.config.max_concurrent_tokens,
             "min_entry_annualized_apr": float(self.config.min_entry_annualized_apr),
             "exit_annualized_apr": float(self.config.exit_annualized_apr),
+            "max_payback_hours": float(self.config.max_payback_hours),
             "updated_at": datetime.now(timezone.utc).isoformat(),
             "active_positions": list(self.active_positions.values()),
             "closed_trades": all_closed,
             "market_candidates": getattr(self, "market_candidates", []),
             "rotation_history": getattr(self, "rotation_history", []),
+            "quarantined_tokens": {k: float(v) for k, v in self.token_quarantine_until.items()},
         }
 
         for path in self.data_file_candidates:
@@ -929,6 +1200,7 @@ class SpotPerpCashCarryStrategy(StrategyV2Base):
                             if tok and tok not in self.active_positions:
                                 self.active_positions[tok] = pos
                         self.rotation_history = data.get("rotation_history", [])
+                        self.token_quarantine_until = {k: float(v) for k, v in data.get("quarantined_tokens", {}).items()}
                         break
                 except Exception:
                     pass
@@ -979,7 +1251,7 @@ class SpotPerpCashCarryStrategy(StrategyV2Base):
 
         for tok, pos in self.active_positions.items():
             lines.append(
-                f"    - {tok}: Spot BUY {pos['amount']:,.2f} @ ${pos['spot_entry_price']:.4f} + "
+                f"    - {tok} (Tier {pos.get('tier', 3)}): Spot BUY {pos['amount']:,.2f} @ ${pos['spot_entry_price']:.4f} + "
                 f"Perp SHORT {pos['amount']:,.2f} @ ${pos['perp_entry_price']:.4f} | "
                 f"Funding Accrued: ${pos.get('settled_funding_pnl', 0.0):+,.2f} | "
                 f"APR: {pos.get('current_apr', pos.get('entry_apr', 0.0)):.1%} | "

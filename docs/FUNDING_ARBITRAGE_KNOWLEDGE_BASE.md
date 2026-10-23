@@ -1486,4 +1486,50 @@ $$Size_{quote} = \min\left(Size_{target}, \sum_{k=1}^{25} (P_k \times Q_k)_{c1} 
   - 将新实例目录下的 `conf/conf_client.yml` 中的 `instance_id` 修改为本实例专属名 `spot-perp-cash-carry-dryrun-neo-20261023-001`；
   - 重启容器后，MQTT 客户端 ID 彻底隔离，两端长连接稳定无断连，中台即刻捕获到独立心跳，API 返回 `status: "running"`，前端大屏即时同步恢复为亮绿色 `(🟢 Running)`。
 
+---
+
+### 49. 现货-期货（Spot-Perp Cash & Carry）回本模型错配根因复盘与期期成熟机制全量集成
+- **痛点现象与数学根因（The High-Frequency Payback Mismatch Trap）**：
+  - 启动现货-永续套利 Dry-Run 实例后，系统在盘口持续高频输出 `⚡ [SPOT-PERP-PULSE]` 预警日志，却始终无法触发任何开仓；
+  - **精算推导（The 260% APR Barrier）**：
+    - 现有开仓拦截门槛为：
+      $$\text{Payback Hours} = \frac{\text{Total Friction} - \text{Basis Spread}}{\text{Hourly Funding Rate}} \le 12.0 \text{ 小时}$$
+    - 现货 Taker 手续费（$0.1\% \times 2 = 0.20\%$）远高于衍生品合约，加上永续双边费用（$0.07\%$）及滑点延迟，进出场硬摩擦达 $0.35\% \sim 0.40\%$ (35~40 bps)；
+    - 要在 12 小时内仅凭资金费吃回 36 bps 摩擦，要求年化资金费率 $\text{APR} \ge \frac{0.36\%}{12} \times 24 \times 365 = 262.8\%$！
+    - **结论**：将期期（Perp-Perp）无锚高频刮头皮（Scalping）的 12 小时极限回本期强加于现货-期货（Cash & Carry），导致市场中绝大多数年化在 $25\% \sim 60\%$ 的优质稳健生息标的被 100% 误杀。
+- **现期（Spot-Perp）与期期（Perp-Perp）底层架构差异辨析**：
+  1. **物理硬锚 vs 双边无锚**：现货为真实代币实物，永续费率机制本质即是强制永续价格锚定现货指数，绝无期期两端无锚发散的无限敞口风险；Cash & Carry 的国际标准持有期为 7 天至 30 天，而非 12 小时；
+  2. **单边空头清算 vs 双边爆仓互杀**：现货全款买入（1x，零爆仓风险），仅需盯防 Hyperliquid 3x 空单腿在币价暴涨时的强平缓冲垫；
+  3. **单腿绝对收益 vs 跨所费率差**：现货端永远不付资金费，仅 Hyperliquid 空单端每 1 小时连续入账真实 USDC；
+  4. **手续费非对称性**：现货 Taker 成本较高，但若永续端处于 Contango 远期升水溢价（Perp > Spot），入场捕获的正基差可直接冲抵交易摩擦。
+- **全量机制集成与落地重构**：
+  1. **现实 Cash & Carry 摩擦收益回本模型**：
+     - 放宽刚性回本期天花板至 $\le 72.0$ 小时；
+     - 引入 14 天（336 小时）标准持有期摩擦收益占比拦截：
+       $$\text{Friction-to-Yield Ratio} = \frac{\text{Total Friction} - \text{Basis Spread}}{\text{Rate}_{1h} \times 336} \le 30\%$$
+     - 若永续升水（Contango），基差盈余（Basis Surplus）直接抵扣手续费，净摩擦 $\le 0$ 时实现 0.0 小时秒级瞬间回本开仓；
+  2. **三层资产分级矩阵（Tier Matrix）与深度安全容量（Safe Capacity）**：
+     - **Tier 1 (BTC, ETH, SOL)**：单笔上限 $5,000，最低 APR 门槛 12%，强平缓冲 8%；
+     - **Tier 2 (AVAX, SUI, APT, NEAR, OP 等优质中盘)**：单笔上限 $2,000，最低 APR 门槛 18%，强平缓冲 12%；
+     - **Tier 3 (ENA, SAGA, W, REZ 等高息小市值/Meme)**：单笔上限 $500，最低 APR 门槛 25%，强平缓冲 16%；
+     - **深度安全容量**：$\text{Position Size} = \min(\text{Tier Max}, \min(\text{Depth}_{spot}, \text{Depth}_{perp}) \times 20\%)$，严禁打穿盘口；
+  3. **整点结算微静默防滑点（Hourly Micro-Blackout :58 ~ :01）**：
+     - 在每小时 Hyperliquid 资金费到账前 2 分钟至到账后 1 分钟（:58 至 :01），自动冻结发起新开仓，规避巨鲸整点调仓导致的瞬间点差扩大；
+  4. **保本追踪（Breakeven Trailing Stop）与分步 50% 减仓止盈（Tranche Take-Profit）**：
+     - 实时盯盘净 ROE，一旦累积收益达到 $+0.8\%$，激活保本锁定逻辑，止损线自动抬高至 $+0.2\%$ 净本金线；
+     - 当持仓净 ROE 达到 $+1.5\%$ 且持仓超 1 小时，自动平掉 $50\%$ 仓位锁定胜果，剩余 $50\%$ 仓位零风险继续吃息；
+  5. **单边强平缓冲防御与有毒标的 24h 冷冻隔离（Quarantine）**：
+     - 仅对 Hyperliquid 空单端监控安全垫（$\frac{P_{liq} - P}{P}$），跌破 Tier 阈值主动双边对冲平仓；
+     - 遇单笔亏损超过 $10 或强平防御平仓的标的，自动关入 24 小时冷冻室（Quarantine），防止在有毒币种上反复磨损割肉；
+  6. **StrategyV2 调度陷阱修复**：
+     - 在 `on_tick` 中显式调用 `self.create_actions_proposal()` 与 `self.stop_actions_proposal()`，消除当 `self.controllers` 为空时父类跳过提议执行的深层缺陷；
+  7. **下架代币剔除**：
+     - 彻底清除已在币安现货更名迁移的 `MATIC`，规避 `KeyError: 'MATIC-USDT'` 盘口连接器中断崩溃。
+- **实战验证与数据表现**：
+  - 容器启动后，30 个盘口连接器秒级完成全量同步，无任何 KeyError；
+  - 策略成功识别并按 Tier 定额完成首批开仓：ENA（Tier 3，$500）、SAGA（Tier 3，$500）、W（Tier 3，$500）、OP（Tier 2，$2,000）等，各币种回本期精准收敛至 29h ~ 54h，完美在 72h 安全区间内；
+  - 高息雷达实时呈现各币种的分层评级（Tier 1/2/3）、安全定额（Safe Capacity）、基差升贴水与回本时长，ALT 币种因回本期高达 139h 被自动精准拦截在 Standby 状态；
+  - 全量 81 项 Dashboard 单元测试与 7 项容器内策略逻辑测试 100% 通过。
+
+
 
