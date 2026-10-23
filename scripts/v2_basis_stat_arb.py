@@ -2094,7 +2094,29 @@ class BasisStatArbitrage(StrategyV2Base):
                     funding = float(ctx.get("funding") or 0.0)
                     hl_assets[name] = {"price": mid, "volume_24h": vol, "funding_rate": funding}
 
-            # 2. Binance perpetuals 24hr tickers
+            # 2. Binance perpetual exchangeInfo & 24hr tickers
+            # Gate 2.1: Strictly filter for active TRADING & pure crypto PERPETUAL contracts (excludes 134+ SETTLING/delisted and 225+ TRADIFI contracts)
+            now_ts = time.time()
+            if not hasattr(self, "_cached_bn_perps") or now_ts - getattr(self, "_cached_bn_perps_ts", 0) > 3600.0:
+                try:
+                    bn_info_req = urllib.request.Request(
+                        "https://fapi.binance.com/fapi/v1/exchangeInfo",
+                        headers={"User-Agent": "Mozilla/5.0"}
+                    )
+                    with urllib.request.urlopen(bn_info_req, timeout=10) as resp:
+                        bn_info_raw = json.loads(resp.read().decode("utf-8"))
+                    self._cached_bn_perps = {
+                        s["symbol"] for s in bn_info_raw.get("symbols", [])
+                        if s.get("contractType") == "PERPETUAL"
+                        and s.get("status") == "TRADING"
+                        and s.get("quoteAsset") == "USDT"
+                    }
+                    self._cached_bn_perps_ts = now_ts
+                except Exception as e:
+                    self.logger().warning(f"Failed to refresh Binance exchangeInfo cache: {e}")
+                    if not hasattr(self, "_cached_bn_perps"):
+                        self._cached_bn_perps = set()
+
             bn_req = urllib.request.Request(
                 "https://fapi.binance.com/fapi/v1/ticker/24hr",
                 headers={"User-Agent": "Mozilla/5.0"}
@@ -2105,6 +2127,8 @@ class BasisStatArbitrage(StrategyV2Base):
             bn_assets = {}
             for item in bn_raw:
                 sym = item.get("symbol", "")
+                if self._cached_bn_perps and sym not in self._cached_bn_perps:
+                    continue
                 if sym.endswith("USDT"):
                     base = sym[:-4]
                     bn_assets[base] = {
