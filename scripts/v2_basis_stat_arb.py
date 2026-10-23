@@ -125,6 +125,37 @@ class BasisStatArbitrageConfig(StrategyV2ConfigBase):
             "prompt_on_new": True
         }
     )
+    # --- Optimization 1: Profit-Locked Early Exit Exemption ---
+    early_take_profit_net_pct: Decimal = Field(
+        default=Decimal("0.0035"),
+        json_schema_extra={
+            "prompt": lambda mi: "High-conviction net profit threshold to waive 60s cooldown and take profit early (e.g. 0.0035 for +0.35%): ",
+            "prompt_on_new": False
+        }
+    )
+    min_early_exit_seconds: int = Field(
+        default=10,
+        json_schema_extra={
+            "prompt": lambda mi: "Minimum holding seconds required before early take-profit can trigger (e.g. 10): ",
+            "prompt_on_new": False
+        }
+    )
+    # --- Optimization 2: Toxic Token Quarantine Circuit Breaker ---
+    divergence_quarantine_seconds: int = Field(
+        default=2700,
+        json_schema_extra={
+            "prompt": lambda mi: "Quarantine seconds for a token after emergency divergence stop-loss (e.g. 2700 for 45m): ",
+            "prompt_on_new": False
+        }
+    )
+    # --- Optimization 4: Breakeven Trailing Floor ---
+    breakeven_trailing_floor_pct: Decimal = Field(
+        default=Decimal("0.0015"),
+        json_schema_extra={
+            "prompt": lambda mi: "Minimum guaranteed net profit floor once trailing stop is armed (e.g. 0.0015 for +0.15%): ",
+            "prompt_on_new": False
+        }
+    )
     require_favorable_funding: bool = Field(
         default=False,
         json_schema_extra={
@@ -464,6 +495,7 @@ class BasisStatArbitrage(StrategyV2Base):
         self.exit_candidate_ticks: Dict[str, int] = {}
         self.divergence_tick_counter: Dict[str, int] = {}
         self.token_last_closed_timestamp: Dict[str, float] = {}
+        self.quarantine_tokens: Dict[str, float] = {}
 
         # Two-Tier Dynamic Universe Rotation & Hot-Swap Engine
         self.market_discovery_candidates: List[Dict] = []
@@ -558,6 +590,12 @@ class BasisStatArbitrage(StrategyV2Base):
                             self.token_admitted_at[tok] = float(persisted_admitted[tok])
                         else:
                             self.token_admitted_at[tok] = now_ts
+
+                    # Restore quarantined tokens if present and not expired
+                    quarantined = data.get("quarantined_tokens", {})
+                    for q_tok, q_ts in quarantined.items():
+                        if float(q_ts) > now_ts:
+                            self.quarantine_tokens[q_tok] = float(q_ts)
 
                     # Restore dynamically adapted universe tokens if present
                     persisted_universe = data.get("active_universe_tokens")
@@ -1158,6 +1196,13 @@ class BasisStatArbitrage(StrategyV2Base):
             if token in self.active_basis_arbitrages:
                 continue
 
+            # Optimization 2: Toxic Token Quarantine check (divergence defense)
+            quarantine_until = self.quarantine_tokens.get(token, 0.0)
+            if self.current_timestamp < quarantine_until:
+                continue
+            elif token in self.quarantine_tokens:
+                del self.quarantine_tokens[token]
+
             # Cooldown check
             last_closed = self.token_last_closed_timestamp.get(token, 0)
             if self.current_timestamp - last_closed < self.config.reentry_cooldown_seconds:
@@ -1677,20 +1722,31 @@ class BasisStatArbitrage(StrategyV2Base):
             net_tp_target = self.config.min_take_profit_net_pct
             net_tp_raw = net_pnl_pct >= net_tp_target
 
-            # 3. Trailing Stop:
+            # 3. Trailing Stop with Breakeven Floor (Optimization 4):
             trail_active_thresh = self.config.trailing_stop_activation_pct
             trail_distance = self.config.trailing_stop_distance_pct
+            trail_floor = getattr(self.config, "breakeven_trailing_floor_pct", Decimal("0.0015"))
             if net_pnl_pct >= trail_active_thresh and not pos.get("trailing_active", False):
                 pos["trailing_active"] = True
-                self.logger().info(f"🛡️ [TRAILING-ARMED] Token '{token}' net PnL reached {float(net_pnl_pct):+.2%}. Trailing stop active!")
+                self.logger().info(f"🛡️ [TRAILING-ARMED] Token '{token}' net PnL reached {float(net_pnl_pct):+.2%}. Trailing stop active with floor {float(trail_floor):+.2%}!")
 
+            is_floor_breached = pos.get("trailing_active", False) and (net_pnl_pct <= trail_floor)
             trailing_stop_raw = (
                 pos.get("trailing_active", False)
-                and Decimal(str(peak_pnl)) - net_pnl_pct >= trail_distance
+                and ((Decimal(str(peak_pnl)) - net_pnl_pct >= trail_distance) or is_floor_breached)
             )
 
-            # Normal exits require minimum holding time:
-            normal_exit_candidate = is_min_hold_passed and (basis_tp_raw or net_tp_raw or trailing_stop_raw)
+            # Optimization 1: Profit-Locked Early Exit Exemption
+            # If high-conviction net profit is achieved (>= early_take_profit_net_pct) and held at least min_early_exit_seconds:
+            early_tp_threshold = getattr(self.config, "early_take_profit_net_pct", Decimal("0.0035"))
+            min_early_s = getattr(self.config, "min_early_exit_seconds", 10)
+            is_early_tp_qualified = (duration_s >= min_early_s) and (net_pnl_pct >= early_tp_threshold)
+
+            # Exit eligibility: passed standard min hold OR qualified for profit-locked early exit
+            is_exit_eligible = is_min_hold_passed or is_early_tp_qualified
+
+            # Normal exits require exit eligibility:
+            normal_exit_candidate = is_exit_eligible and (basis_tp_raw or net_tp_raw or trailing_stop_raw or is_early_tp_qualified)
 
             # Exit persistence: require 2 consecutive ticks before closing
             req_exit_ticks = getattr(self.config, "exit_persistence_ticks", 2)
@@ -1701,9 +1757,10 @@ class BasisStatArbitrage(StrategyV2Base):
 
             is_exit_confirmed = (self.exit_candidate_ticks.get(token, 0) >= req_exit_ticks)
 
-            basis_tp_condition = is_exit_confirmed and basis_tp_raw
-            net_tp_condition = is_exit_confirmed and net_tp_raw
-            trailing_stop_condition = is_exit_confirmed and trailing_stop_raw
+            early_tp_condition = is_exit_confirmed and is_early_tp_qualified
+            basis_tp_condition = is_exit_confirmed and basis_tp_raw and is_exit_eligible
+            net_tp_condition = is_exit_confirmed and net_tp_raw and is_exit_eligible
+            trailing_stop_condition = is_exit_confirmed and trailing_stop_raw and is_exit_eligible
 
             # 4. Max Hold Timeout Expiry:
             max_h = float(self.config.max_hold_hours)
@@ -1722,9 +1779,11 @@ class BasisStatArbitrage(StrategyV2Base):
             stop_loss_condition = self.divergence_tick_counter.get(token, 0) >= req_divergence_ticks
 
             # Check if any condition triggered
-            if basis_tp_condition or net_tp_condition or trailing_stop_condition or timeout_condition or stop_loss_condition:
+            if basis_tp_condition or net_tp_condition or trailing_stop_condition or timeout_condition or stop_loss_condition or early_tp_condition:
                 if stop_loss_condition:
                     reason = f"Emergency Basis Divergence Stop-Loss ({float(net_pnl_pct):.2%} <= -{float(max_loss_pct):.2%})"
+                elif early_tp_condition:
+                    reason = f"Profit-Locked Early TP (+{float(net_pnl_pct):.2%} >= +{float(early_tp_threshold):.2%}, held {duration_s}s)"
                 elif basis_tp_condition:
                     if total_net_pnl >= 0:
                         reason = f"Basis Mean-Reversion TP (Basis compressed to {float(curr_basis):+.2%})"
@@ -1733,7 +1792,10 @@ class BasisStatArbitrage(StrategyV2Base):
                 elif net_tp_condition:
                     reason = f"Net PnL Target Take-Profit (+{float(net_pnl_pct):.2%} >= +{float(net_tp_target):.2%})"
                 elif trailing_stop_condition:
-                    reason = f"Trailing Stop Take-Profit (Peak: +{peak_pnl:.2%}, Retraced to {float(net_pnl_pct):+.2%})"
+                    if is_floor_breached:
+                        reason = f"Trailing Stop Floor Protected (Peak: +{peak_pnl:.2%}, Secured at {float(net_pnl_pct):+.2%})"
+                    else:
+                        reason = f"Trailing Stop Take-Profit (Peak: +{peak_pnl:.2%}, Retraced to {float(net_pnl_pct):+.2%})"
                 elif timeout_condition:
                     reason = f"Max Duration Timeout Exit ({duration_h:.1f}h >= {max_h:.1f}h)"
                 else:
@@ -1769,6 +1831,15 @@ class BasisStatArbitrage(StrategyV2Base):
             token = item["token"]
             pos = self.active_basis_arbitrages.pop(token)
             self.token_last_closed_timestamp[token] = self.current_timestamp
+
+            # Optimization 2: Toxic Token Quarantine trigger (divergence defense)
+            if "Emergency Basis Divergence Stop-Loss" in item["reason"] or float(item["total_net_pnl"]) <= -3.0:
+                quarantine_s = int(getattr(self.config, "divergence_quarantine_seconds", 2700))
+                self.quarantine_tokens[token] = self.current_timestamp + quarantine_s
+                self.logger().warning(
+                    f"🚨 [QUARANTINE-ACTIVATED] Token '{token}' quarantined for {quarantine_s // 60}m "
+                    f"until {self.current_timestamp + quarantine_s} due to divergence stop-loss!"
+                )
 
             # Count unique settlement window timestamps
             unique_windows = len(set(p.get("timestamp") for p in pos.get("funding_payments", []) if p.get("timestamp")))
@@ -1937,6 +2008,7 @@ class BasisStatArbitrage(StrategyV2Base):
             "rotation_history": getattr(self, "rotation_history", []),
             "token_admitted_at": getattr(self, "token_admitted_at", {}),
             "active_universe_tokens": list(self.config.tokens),
+            "quarantined_tokens": {tok: ts for tok, ts in self.quarantine_tokens.items() if self.current_timestamp < ts},
             "tick_latency_ms": round(getattr(self, "_last_tick_latency_ms", 0.0), 1),
             "auto_rotation_enabled": getattr(self.config, "auto_rotation_enabled", True),
             "auto_rotation_interval_minutes": getattr(self.config, "auto_rotation_interval_minutes", 3.0),
@@ -2118,7 +2190,11 @@ class BasisStatArbitrage(StrategyV2Base):
 
                         thresh = float(self.config.min_entry_basis_pct)
                         min_edge_thresh = float(getattr(self.config, "min_executable_net_edge_pct", Decimal("0.0018")))
-                        if min_top3 < min_order_sz:
+                        q_until = self.quarantine_tokens.get(t, 0.0)
+                        if self.current_timestamp < q_until:
+                            rem_m = max(1, int((q_until - self.current_timestamp) / 60))
+                            status_str = f"🚨 动量撕裂冷冻隔离中 (剩余 {rem_m}m)"
+                        elif min_top3 < min_order_sz:
                             status_str = f"🛡️ 流动性虚幻/拦截 (Top3: ${float(min_top3):,.0f})"
                         elif best_spread >= thresh and net_edge < min_edge_thresh:
                             status_str = f"🛡️ 穿透拦截 (净利 {net_edge:+.2%} < {min_edge_thresh*10000:.0f}bps)"
