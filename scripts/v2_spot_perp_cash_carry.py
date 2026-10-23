@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Dict, List, Optional, Set, Tuple
 
-from pydantic import Field
+from pydantic import Field, field_validator
 
 from hummingbot.client.config.config_data_types import ClientConfigEnum
 from hummingbot.connector.connector_base import ConnectorBase
@@ -38,7 +38,7 @@ class SpotPerpCashCarryConfig(StrategyV2ConfigBase):
     )
     tokens: List[str] = Field(
         default=[
-            "ENA", "SAGA", "W", "REZ", "ALT", "OM", "TIA", "SEI",
+            "ENA", "SAGA", "W", "REZ", "ALT", "OP", "TIA", "SEI",
             "NEAR", "JUP", "WIF", "LDO", "RENDER", "SUI", "APT"
         ],
         json_schema_extra={
@@ -129,6 +129,14 @@ class SpotPerpCashCarryConfig(StrategyV2ConfigBase):
     dry_run_virtual_spot_quote: Decimal = Field(default=Decimal("3000.0"))
     dry_run_virtual_perp_quote: Decimal = Field(default=Decimal("1500.0"))
 
+    @field_validator("tokens", mode="before")
+    def validate_tokens(cls, v):
+        if isinstance(v, str):
+            return [val.strip().upper() for val in v.split(",") if val.strip()]
+        if isinstance(v, (list, set, tuple)):
+            return [str(val).strip().upper() for val in v if str(val).strip()]
+        return v
+
 
 class SpotPerpCashCarryStrategy(StrategyV2Base):
     """
@@ -153,7 +161,11 @@ class SpotPerpCashCarryStrategy(StrategyV2Base):
         perp_conn = config.perp_connector
         cls.markets = {spot_conn: set(), perp_conn: set()}
 
-        for tok in config.tokens:
+        tokens_list = config.tokens
+        if isinstance(tokens_list, str):
+            tokens_list = [val.strip().upper() for val in tokens_list.split(",") if val.strip()]
+
+        for tok in tokens_list:
             cls.markets[spot_conn].add(f"{tok}-USDT")
             cls.markets[perp_conn].add(f"{tok}-USD")
 
@@ -175,30 +187,39 @@ class SpotPerpCashCarryStrategy(StrategyV2Base):
                     from hummingbot.client.config.security import Security
                     keys = Security.api_keys(connector_name)
                     if not keys:
-                        conn_class = get_connector_class(connector_name)
                         conn_setting = AllConnectorSettings.get_connector_settings().get(connector_name)
-                        params = {
-                            "connector_name": connector_name,
-                            "trading_pairs": trading_pairs or [],
-                            "trading_required": False,
-                        }
-                        if conn_setting and getattr(conn_setting, "is_sub_domain", False):
-                            params["domain"] = getattr(conn_setting, "domain_parameter", None)
+                        if conn_setting:
+                            connector_class = get_connector_class(connector_name)
+                            dummy_keys = {}
+                            if connector_name == "binance":
+                                dummy_keys = {"binance_api_key": "dummy_key", "binance_api_secret": "dummy_secret"}
+                            elif hasattr(conn_setting, "config_keys") and conn_setting.config_keys:
+                                if isinstance(conn_setting.config_keys, dict):
+                                    dummy_keys = {k: "dummy" for k in conn_setting.config_keys.keys()}
 
-                        try:
-                            connector = conn_class(**params)
-                        except TypeError:
-                            params.pop("connector_name", None)
-                            connector = conn_class(**params)
-
-                        RateOracle.get_instance().register_connector(connector)
-                        return connector
+                            init_params = conn_setting.conn_init_parameters(
+                                trading_pairs=trading_pairs,
+                                trading_required=False,
+                                api_keys=dummy_keys,
+                                balance_asset_limit=getattr(self.client_config_map.hb_config, "balance_asset_limit", None),
+                                rate_limits_share_pct=getattr(self.client_config_map.hb_config, "rate_limits_share_pct", Decimal("100")),
+                                gateway_config=getattr(self.client_config_map.hb_config, "gateway", None),
+                            )
+                            init_params["trading_required"] = False
+                            connector = connector_class(**init_params)
+                            self.connectors[connector_name] = connector
+                            try:
+                                RateOracle.get_instance().register_connector(connector)
+                            except Exception:
+                                pass
+                            cls.logger().info(f"[DRY-RUN] Initialized public market connector for '{connector_name}'.")
+                            return connector
                 return orig_create(self, connector_name, trading_pairs, trading_required, api_keys)
 
             ConnectorManager.create_connector = patched_create
             ConnectorManager._dry_run_spot_perp_patched = True
-        except Exception:
-            pass
+        except Exception as e:
+            cls.logger().warning(f"Failed to patch ConnectorManager for dry-run: {e}")
 
     def __init__(self, connectors: Dict[str, ConnectorBase], config: SpotPerpCashCarryConfig):
         super().__init__(connectors, config)
@@ -216,6 +237,7 @@ class SpotPerpCashCarryStrategy(StrategyV2Base):
         self._universe_lock = asyncio.Lock()
         self._rotation_in_progress = False
         self._last_rotation_check_ts = 0.0
+        self._last_candidates_scan_ts = 0.0
 
         # Set leverage and position mode on Perp connector for live trading
         if not self.config.dry_run:
@@ -238,6 +260,7 @@ class SpotPerpCashCarryStrategy(StrategyV2Base):
             os.path.abspath(f"/home/neo/projects/hummingbot/hummingbot-api/bots/data/spot_perp_cash_carry_trades.json"),
         ]
         self._load_persisted_state()
+        self._persist_state()
 
     # =========================================================================
     # Strategy Main Loop Hooks
@@ -247,6 +270,9 @@ class SpotPerpCashCarryStrategy(StrategyV2Base):
         """Execute tick loop every 1.0s."""
         t0 = time.perf_counter()
         super().on_tick()
+
+        if not self.ready_to_trade:
+            return
 
         # 1. Discrete funding settlement accounting on Hyperliquid (1h cycle)
         self.account_for_discrete_funding_settlements()
@@ -668,9 +694,9 @@ class SpotPerpCashCarryStrategy(StrategyV2Base):
             return
 
         now = self.current_timestamp
-        if now - self._last_rotation_check_ts < (self.config.auto_rotation_interval_minutes * 60.0):
+        if now - self._last_candidates_scan_ts < 15.0:
             return
-        self._last_rotation_check_ts = now
+        self._last_candidates_scan_ts = now
 
         c_spot = self.config.spot_connector
         c_perp = self.config.perp_connector
@@ -693,8 +719,8 @@ class SpotPerpCashCarryStrategy(StrategyV2Base):
                     rate_1h = Decimal("0.0001")
                 annual_apr = rate_1h * Decimal("24") * Decimal("365")
 
-                p_spot = conn_spot.get_price(tp_spot, is_buy=True)
-                p_perp = conn_perp.get_price(tp_perp, is_buy=False)
+                p_spot = self.get_price_from_orderbook(c_spot, tp_spot, is_buy=True)
+                p_perp = self.get_price_from_orderbook(c_perp, tp_perp, is_buy=False)
                 basis = (p_perp - p_spot) / p_spot if p_spot and p_perp else Decimal("0")
 
                 depth_spot = self.get_top_depth_quote(c_spot, tp_spot, is_buy=True)
@@ -718,14 +744,18 @@ class SpotPerpCashCarryStrategy(StrategyV2Base):
                     "is_active": is_active,
                     "status": "In Position" if is_active else ("Eligible" if annual_apr >= self.config.min_entry_annualized_apr and payback_h <= self.config.max_payback_hours else "Standby")
                 })
-            except Exception:
-                pass
+            except Exception as e:
+                import traceback
+                self.logger().warning(f"Error scanning candidate {tok}: {e}\n{traceback.format_exc()}")
 
         candidates.sort(key=lambda x: x["annual_apr"], reverse=True)
         self.market_candidates = candidates
+        self._persist_state()
 
-        # Evaluate hot-swap if full and a standby token has higher yield
-        if len(self.active_positions) >= self.config.max_concurrent_tokens:
+        # Evaluate hot-swap if full and rotation interval has elapsed
+        rotation_due = (now - self._last_rotation_check_ts >= (self.config.auto_rotation_interval_minutes * 60.0))
+        if rotation_due and len(self.active_positions) >= self.config.max_concurrent_tokens:
+            self._last_rotation_check_ts = now
             top_standby = next((c for c in candidates if not c["is_active"] and c["status"] == "Eligible"), None)
             if top_standby:
                 # Find lowest active APR token
@@ -755,6 +785,27 @@ class SpotPerpCashCarryStrategy(StrategyV2Base):
     # Helpers & Orderbook Metric Resolvers
     # =========================================================================
 
+    def get_price_from_orderbook(self, connector_name: str, trading_pair: str, is_buy: bool) -> Optional[Decimal]:
+        """Safely retrieve top-of-book price directly from orderbook without relying on initialized trading rules."""
+        connector = self.connectors.get(connector_name)
+        if not connector:
+            return None
+        try:
+            ob = connector.get_order_book(trading_pair)
+            if ob:
+                p = ob.get_price(is_buy)
+                if p is not None and not math.isnan(p) and p > 0:
+                    return Decimal(str(p))
+        except Exception:
+            pass
+        try:
+            p = connector.get_price(trading_pair, is_buy)
+            if p is not None and not math.isnan(float(p)) and float(p) > 0:
+                return Decimal(str(p))
+        except Exception:
+            pass
+        return None
+
     def get_orderbook_execution_metrics(
         self, connector_name: str, trading_pair: str, is_buy: bool,
         quote_volume: Optional[Decimal] = None, base_amount: Optional[Decimal] = None
@@ -768,7 +819,7 @@ class SpotPerpCashCarryStrategy(StrategyV2Base):
         if not ob:
             return None, None, None, None
 
-        best_price = connector.get_price(trading_pair, is_buy)
+        best_price = self.get_price_from_orderbook(connector_name, trading_pair, is_buy)
         if best_price is None or best_price <= Decimal("0"):
             return None, None, None, None
 
@@ -910,7 +961,12 @@ class SpotPerpCashCarryStrategy(StrategyV2Base):
                 "custom_info": custom_info,
             }
         }
-        self.logger().info(f"[TELEMETRY] Spot-Perp report published. Active: {len(self.active_positions)}, Closed: {len(all_closed)}")
+        now = time.time()
+        if not hasattr(self, "_last_telemetry_log_ts") or now - self._last_telemetry_log_ts >= 60.0:
+            self._last_telemetry_log_ts = now
+            self.logger().info(f"[TELEMETRY] Spot-Perp report published. Active: {len(self.active_positions)}, Closed: {len(all_closed)}")
+        else:
+            self.logger().debug(f"[TELEMETRY] Spot-Perp report published. Active: {len(self.active_positions)}, Closed: {len(all_closed)}")
 
     def format_status(self) -> str:
         """User status display command."""
