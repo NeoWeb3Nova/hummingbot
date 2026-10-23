@@ -1380,3 +1380,110 @@ $$Size_{quote} = \min\left(Size_{target}, \sum_{k=1}^{25} (P_k \times Q_k)_{c1} 
   - 独立底账：`spot_perp_cash_carry_trades.json`，与基差套利底账完全物理隔离；
   - 前端看板：`spot_perp_cash_carry_view.py` 提供在役持仓卡片、1h 到账倒计时、强平缓冲垫仪表盘、高息雷达矩阵与历史结算表；
   - 自动化回归：`hummingbot-dashboard` 80 项全量测试 100% 通过；`hummingbot-api` 17 项测试 100% 通过。
+
+---
+
+### 45. Dry-Run 模式下公共行情连接器初始化缺少必须位置参数报错排查
+- **问题现象与报错栈（Missing Required Positional Arguments）**：
+  - 启动现货-永续 Dry-Run 实例 `spot-perp-cash-carry-dryrun-neo-20261023-001` 时，策略在快速启动阶段抛出致命异常：
+    ```text
+    ERROR - Failed to start strategy v2_spot_perp_cash_carry: BinanceExchange.__init__() missing 2 required positional arguments: 'binance_api_key' and 'binance_api_secret'
+    ```
+- **根因分析（Root Cause Analysis）**：
+  - 在 Hummingbot 架构中，永续衍生品连接器（如 `BinancePerpetualDerivative`、`HyperliquidPerpetualDerivative`）的 `__init__` 中将私钥参数设置为带默认值的关键字参数（`binance_perpetual_api_key: str = None`）；
+  - 但现货连接器 `BinanceExchange.__init__` 则严格定义为位置必须参数：
+    ```python
+    def __init__(self, binance_api_key: str, binance_api_secret: str, ...)
+    ```
+  - 当通过 `_enable_dry_run_connectors()` 拦截并尝试用 `api_keys={}` 进行免私钥纯行情订阅初始化时，`conn_init_parameters` 返回的字典缺失了这两个位置参数，导致 Python 构造方法抛出 `TypeError` 崩溃。
+- **解决方案与工程实践（The Dummy Key Injection Pattern）**：
+  - 在 `_enable_dry_run_connectors()` 钩子函数中，针对非交易模式（`trading_required=False`）补全虚拟哑元凭证：
+    ```python
+    dummy_keys = {}
+    if connector_name == "binance":
+        dummy_keys = {"binance_api_key": "dummy_key", "binance_api_secret": "dummy_secret"}
+    elif hasattr(conn_setting, "config_keys") and conn_setting.config_keys:
+        if isinstance(conn_setting.config_keys, dict):
+            dummy_keys = {k: "dummy" for k in conn_setting.config_keys.keys()}
+    ```
+  - 当 `trading_required=False` 时，Hummingbot 只启动 WebSocket 公共盘口跟踪器（OrderBookTracker），绝不会用该凭证向交易所发送私有鉴权签名请求，成功实现免 API Key 真实订单簿深度与资金费率全量秒级串流。
+
+---
+
+### 46. 交易所状态处于 BREAK 的代币导致 OrderBookTracker 订阅抛 KeyError 陷阱
+- **问题现象与排查（KeyError: 'OM-USDT' during Subscription）**：
+  - 解决哑元凭证后，币安现货订阅通道在连接时反复报错并每 5 秒重启：
+    ```text
+    KeyError: 'OM-USDT'
+    File "hummingbot/connector/exchange_base.pyx", line 97, in exchange_symbol_associated_to_pair
+        return symbol_map.inverse[trading_pair]
+    ```
+- **根因分析（Binance ExchangeInfo Status Filter）**：
+  - 经对币安官方 REST API `/api/v3/exchangeInfo?symbol=OMUSDT` 进行穿透审计，发现 `OMUSDT` 的官方状态为 `"status": "BREAK"`（临时维护或停盘）；
+  - Hummingbot 的 `BinanceExchange._initialize_trading_pair_symbols_from_exchange_info` 内部使用了 `binance_utils.is_exchange_information_valid` 进行白名单过滤：
+    ```python
+    if exchange_info.get("status", None) == "TRADING":
+        is_trading = True
+    ```
+  - 只有 `"TRADING"` 的币种才会被加入双向映射字典 `_trading_pair_symbol_map`。当策略将处于 `"BREAK"` 的币种列入候选池时，`symbol_map.inverse` 因查不到该交易对抛出 `KeyError`。
+- **解决方案与候选池优化**：
+  - 使用 Python 脚本对预选池全部 15 个代币的官方状态进行自动化验证（`ENA`, `SAGA`, `W`, `REZ`, `ALT`, `TIA`, `SEI`, `NEAR`, `JUP`, `WIF`, `LDO`, `RENDER`, `SUI`, `APT` 均为正常的 `"TRADING"`）；
+  - 将处于 `"BREAK"` 的 `OM` 从监控清单中剔除，替换为高流动性且双边均处于交易状态的 `OP`（Optimism）；
+  - 同时在策略配置验证器中加入 `@field_validator("tokens", mode="before")`，兼容 YAML 列表与逗号分隔字符串。
+
+---
+
+### 47. Dry-Run 模式下未初始化交易规则引发 get_price 量化 KeyError 崩溃
+- **问题现象与堆栈（KeyError in get_order_price_quantum）**：
+  - 盘口成功建立连接后，策略每 15 秒执行动态轮动雷达巡检时，所有代币均报出 Warning：
+    ```text
+    WARNING - Error scanning candidate SUI: 'SUI-USDT'
+    Traceback (most recent call last):
+      File ".../v2_spot_perp_cash_carry.py", line 722, in check_universe_rotation
+        p_spot = conn_spot.get_price(tp_spot, is_buy=True)
+      File "hummingbot/connector/exchange_base.pyx", line 275, in get_price
+        return self.c_get_price(trading_pair, is_buy)
+      File "hummingbot/connector/exchange_base.pyx", line 165, in c_get_price
+        return self.c_quantize_order_price(trading_pair, top_price)
+      File ".../exchange_py_base.py", line 231, in get_order_price_quantum
+        trading_rule = self._trading_rules[trading_pair]
+    KeyError: 'SUI-USDT'
+    ```
+- **根因分析（Uninitialized Trading Rules in Public Mode）**：
+  - `ExchangePyBase._start_network()` 设计中，当 `is_trading_required=False` 时，系统明确跳过 `_trading_rules_polling_loop` 轮询任务以节约网络开销；
+  - 因此 `self._trading_rules` 字典完全为空；
+  - 原生 `connector.get_price()` 底层会调用 Cython 量化方法 `c_quantize_order_price()`，该方法强依赖 `self._trading_rules[trading_pair]` 来获取最小价格步长 `min_price_increment`，遇到空字典即直接抛出 `KeyError`。
+- **解决方案（Direct OrderBook Pricing Pattern）**：
+  - 封装专用的直接盘口取价方法 `get_price_from_orderbook(connector_name, trading_pair, is_buy)`；
+  - 优先穿透到 C++ 底层订单簿对象：
+    ```python
+    ob = connector.get_order_book(trading_pair)
+    if ob:
+        p = ob.get_price(is_buy)  # 直接读取 C++ _best_ask / _best_bid
+        if p and not math.isnan(p) and p > 0:
+            return Decimal(str(p))
+    ```
+  - `ob.get_price(is_buy)` 纯粹基于已同步的公共订单簿深度的顶层价格，完全不依赖任何交易规则或私有凭证，彻底杜绝 `KeyError`，盘口数据全量正常流转，高息雷达与回本期矩阵瞬间完成 100% 实时计算。
+
+---
+
+### 48. 实例配置继承引发 MQTT instance_id 冲突致前端假死（Stopped）与互踢断连
+- **问题现象与排查（Dashboard Stopped with Running Container）**：
+  - 宿主机 Docker 查看容器状态正常运行（`Up 50+ minutes`），但 Streamlit Dashboard 页面却显示为 `(🟡 Stopped)`；
+  - 检查两个运行实例日志，均频繁出现每 5 秒重连一次的告警：
+    ```text
+    WARNING - MQTT bridge disconnected: Disconnected during message iteration. Reconnecting in 5.0s.
+    ```
+- **根因分析（MQTT Client ID Collision & Bot Discovery Hijack）**：
+  - 在创建新实例 `spot-perp-cash-carry-dryrun-neo-20261023-001` 时，基础配置文件 `conf_client.yml` 复制自既有实例 `basis-stat-arb-dryrun-neo-20261020-001`；
+  - 该文件中第 5 行遗留了硬编码的旧实例名：
+    ```yaml
+    instance_id: basis-stat-arb-dryrun-neo-20261020-001
+    ```
+  - **严重后果一（MQTT 互踢）**：EMQX 消息中间件严格禁止相同 Client ID 的并发长连接。新旧两个 Bot 均使用 `basis-stat-arb` 的 Client ID 登入 Broker，导致两台容器在网络层面陷入互相踢下线的恶性死循环；
+  - **严重后果二（心跳主题被冒领）**：新 Bot 发布的 MQTT 遥测与心跳主题全被发到了 `hbot/basis-stat-arb...`。调度中台 `MQTTManager` 的 `_discovered_bots` 字典中始终记录不到 `spot-perp-cash-carry...` 的心跳，导致 `recently_active` 判定为 `False`，中台 API 将其状态返回为 `"stopped"`，前端遂渲染黄色 `(🟡 Stopped)` 标签。
+- **解决方案与规范落地**：
+  - 将新实例目录下的 `conf/conf_client.yml` 中的 `instance_id` 修改为本实例专属名 `spot-perp-cash-carry-dryrun-neo-20261023-001`；
+  - 重启容器后，MQTT 客户端 ID 彻底隔离，两端长连接稳定无断连，中台即刻捕获到独立心跳，API 返回 `status: "running"`，前端大屏即时同步恢复为亮绿色 `(🟢 Running)`。
+
+
