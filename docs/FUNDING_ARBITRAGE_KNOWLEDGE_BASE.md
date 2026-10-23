@@ -1337,3 +1337,17 @@ $$Size_{quote} = \min\left(Size_{target}, \sum_{k=1}^{25} (P_k \times Q_k)_{c1} 
   - 更新单元测试 `test_closed_trade_card_html_content` 与 `test_closed_trades_table_captured_basis_column`，验证列顺序（平仓基差 ➔ 实际捕获基差 ➔ 理论毛价差）与卡片渲染准确度；
   - `hummingbot-dashboard` 27 项基差测试 + 75 项全量测试 100% 通过；
   - `hummingbot-api` 12 项测试 100% 通过。
+
+---
+
+### 43. 纯期期费率套利安全离线归档与现货-永续（Spot-Perp Cash & Carry）战略孵化决议
+- **实战背景与战略共识（Strategic Transition & De-prioritizing Perp-Perp）**：
+  - 经过长期 Dry-Run（41 笔）与 Dynamic Paper（8 笔）的真实数据实证，永续-永续跨所套利存在“资金费收益 vs 价格摩擦亏损 1:17”的结构性死穴；
+  - 经用户与开发团队共同深度复盘，正式达成战略决议：
+    1. **期期套利（Perp-Perp）离线冰冻归档**：代码资产 100% 完整保留在 `scripts/v2_funding_rate_arb.py`，作为未来极端狂暴牛市高费率脉冲（单期 2%~3%）或做市商返佣（VIP 负费率）场景下的“开关式一键复活”战略储备；
+    2. **运行实例与环境零污染清理**：下线并删除 Docker 容器 `funding-arb-dynamic-paper-neo-20261021-055610`，将实例日志与数据完整移至 `bots/archived/` 作为审计冷库；
+    3. **现货-永续（Spot-Perp Cash & Carry）战略孵化**：依托现货硬交割锚彻底消除基差发散无限大风险，实现零借币负费率、无风险稳健生息的“正规军”量化体系。
+- **架构解耦与归档落地验证**：
+  - 执行 `docker stop` 与 `docker rm` 安全下线旧容器，系统 CPU 与内存负载下降；
+  - 实例文件夹 `funding-arb-dynamic-paper-neo-20261021-055610` 迁入 `bots/archived/`，严格保持 UID 1000:1000 宿主属主，杜绝权限冲突；
+  - 当前工作区仅保留处于 100% 胜率盈利状态的 `basis-stat-arb-dryrun-neo-20261020-001` 全功率运转，两套系统互不干扰，解耦度达 100%。
