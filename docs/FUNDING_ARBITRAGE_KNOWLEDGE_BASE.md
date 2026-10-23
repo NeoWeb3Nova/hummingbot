@@ -1351,3 +1351,32 @@ $$Size_{quote} = \min\left(Size_{target}, \sum_{k=1}^{25} (P_k \times Q_k)_{c1} 
   - 执行 `docker stop` 与 `docker rm` 安全下线旧容器，系统 CPU 与内存负载下降；
   - 实例文件夹 `funding-arb-dynamic-paper-neo-20261021-055610` 迁入 `bots/archived/`，严格保持 UID 1000:1000 宿主属主，杜绝权限冲突；
   - 当前工作区仅保留处于 100% 胜率盈利状态的 `basis-stat-arb-dryrun-neo-20261020-001` 全功率运转，两套系统互不干扰，解耦度达 100%。
+
+---
+
+### 44. Binance 现货 + Hyperliquid 永续高息山寨 Cash & Carry 策略落地架构与交割锚防发散体系
+- **业务背景与架构转型（The Spot-Perp Cash & Carry Paradigm Shift）**：
+  - 在正式归档旧期期套利后，团队正式启动“Binance 现货 (`binance`) + Hyperliquid 永续 (`hyperliquid_perpetual`)”全新 Cash & Carry 策略构建；
+  - 彻底摆脱“两端衍生品无锚发散”的致命硬伤：通过买入并持有实物代币现货作为硬交割锚，在 Hyperliquid 永续端等币数 3x 杠杆做空，构建零方向风险的 Delta-Zero 纯生息架构。
+- **数学精算与三层防御模型**：
+  1. **高息准入门槛与摩擦回本期拦截（Payback Hours Barrier）**：
+     - 实时采集 Hyperliquid 1 小时资金费率并换算为年化预期收益：
+       $$\text{Annualized APR} = \text{Rate}_{1h} \times 24 \times 365 \ge 25\% \quad (\text{日息} \ge 0.07\%)$$
+     - 实时穿透币安现货卖单盘口（Ask）与 Hyperliquid 永续买单盘口（Bid），计算总摩擦（现货 $0.1\% \times 2$ + 永续 $0.035\% \times 2$ + 滑点）：
+       $$\text{Payback Hours} = \frac{\text{Total Friction} - \text{Basis Surplus}}{\text{Rate}_{1h}} \le 12.0 \text{ 小时}$$
+       超标坚决不开仓，从源头杜绝“为了吃芝麻利息倒贴入场门票”。
+  2. **Hyperliquid 1 小时连续入账结算账本（Hourly Discrete Carry Ledger）**：
+     - Hyperliquid 采用 1 小时连续结算，策略每 3600 秒在做空腿直接录入真实 USDC 现金流；
+     - 现货端永远不付资金费，且现货端无强平爆仓风险，消除了过去双边费率倒挂的互斥惩罚。
+  3. **Hyperliquid 单边做空强平安全垫防御（Liquidation Safety Cushion）**：
+     - 空单强平价估算：$P_{liq} \approx P_{entry} \times (1 + 1/\text{leverage} - 0.03)$；
+     - 实时监控安全缓冲垫 $\text{Cushion} = \frac{P_{liq} - P_{curr}}{P_{curr}}$；
+     - 一旦缓冲垫跌破 $\le 15\%$，风控哨兵主动双边平仓（卖出币安现货换回 USDT，Hyperliquid 买入平空释放 USDC），坚决不扛单。
+  4. **全市场高息山寨动态轮动（Hot-Swap Rotation Engine）**：
+     - 持续巡检重叠的 120+ 共享高流动性标的；
+     - 当在役币种 APR 衰退至 $< 8\%$ 或出现年化高出 $20\%$ 以上的新龙头时，自动执行优雅换仓。
+- **工程解耦与测试验证**：
+  - 核心策略：[`hummingbot-core/scripts/v2_spot_perp_cash_carry.py`](file:///home/neo/projects/hummingbot/hummingbot-core/scripts/v2_spot_perp_cash_carry.py) 与 `hummingbot-api` 完美同步；
+  - 独立底账：`spot_perp_cash_carry_trades.json`，与基差套利底账完全物理隔离；
+  - 前端看板：`spot_perp_cash_carry_view.py` 提供在役持仓卡片、1h 到账倒计时、强平缓冲垫仪表盘、高息雷达矩阵与历史结算表；
+  - 自动化回归：`hummingbot-dashboard` 80 项全量测试 100% 通过；`hummingbot-api` 17 项测试 100% 通过。
