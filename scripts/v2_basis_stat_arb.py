@@ -267,6 +267,37 @@ class BasisStatArbitrageConfig(StrategyV2ConfigBase):
             "prompt_on_new": False,
         }
     )
+    check_margin_before_entry: bool = Field(
+        default=True,
+        json_schema_extra={
+            "prompt": lambda mi: "Verify real available balance/collateral on both exchanges before placing orders? (True/False): ",
+            "prompt_on_new": True,
+        }
+    )
+    margin_buffer_ratio: Decimal = Field(
+        default=Decimal("0.05"),
+        ge=Decimal("0.0"),
+        le=Decimal("0.50"),
+        json_schema_extra={
+            "prompt": lambda mi: "Safety cushion ratio over initial margin for fees and slippage (e.g. 0.05 for 5%): ",
+            "prompt_on_new": False,
+        }
+    )
+    margin_aware_downsizing: bool = Field(
+        default=True,
+        json_schema_extra={
+            "prompt": lambda mi: "Adaptively scale down order size if available margin is below target but >= min_order_size? (True/False): ",
+            "prompt_on_new": False,
+        }
+    )
+    dry_run_virtual_balance_quote: Decimal = Field(
+        default=Decimal("0.0"),
+        ge=Decimal("0.0"),
+        json_schema_extra={
+            "prompt": lambda mi: "Virtual wallet balance for dry-run margin simulation (0.0 for unlimited): ",
+            "prompt_on_new": False,
+        }
+    )
 
     @field_validator("tokens", mode="before")
     def validate_tokens(cls, v):
@@ -977,6 +1008,142 @@ class BasisStatArbitrage(StrategyV2Base):
         except Exception:
             return Decimal("0")
 
+    def get_connector_available_collateral(self, connector_name: str, trading_pair: str) -> Tuple[Decimal, str]:
+        """
+        Query real available margin/collateral for a connector.
+        Returns (available_balance, collateral_asset_symbol).
+        Handles derivative conventions:
+        - Hyperliquid Perpetual: collateral is typically 'USD' or 'USDC'.
+        - Binance Perpetual: collateral is 'USDT' or 'USDC'.
+        - Fallbacks gracefully to split_trading_pair quote asset.
+        """
+        connector = self.connectors.get(connector_name)
+        if not connector:
+            return Decimal("0"), "UNKNOWN"
+
+        collateral_asset = "USDT"
+        if "-" in trading_pair:
+            collateral_asset = trading_pair.split("-")[1].upper()
+
+        avail = Decimal(str(connector.get_available_balance(collateral_asset)))
+
+        # For Hyperliquid or specific perps, quote might be USD while account stores USDC, or vice versa
+        if avail <= Decimal("0"):
+            if "hyperliquid" in connector_name:
+                alt_asset = "USDC" if collateral_asset == "USD" else "USD"
+                alt_avail = Decimal(str(connector.get_available_balance(alt_asset)))
+                if alt_avail > Decimal("0"):
+                    return alt_avail, alt_asset
+            elif "binance" in connector_name:
+                alt_asset = "USDC" if collateral_asset == "USDT" else "USDT"
+                alt_avail = Decimal(str(connector.get_available_balance(alt_asset)))
+                if alt_avail > Decimal("0"):
+                    return alt_avail, alt_asset
+
+        return avail, collateral_asset
+
+    def _check_dual_exchange_margin_sufficiency(
+        self,
+        token: str,
+        c1: str,
+        tp1: str,
+        c1_exec_price: Decimal,
+        c2: str,
+        tp2: str,
+        c2_exec_price: Decimal,
+        pos_size: Decimal,
+    ) -> Tuple[bool, Decimal, str]:
+        """
+        Institutional Pre-Flight Margin Verification Gate:
+        Checks available collateral on BOTH exchanges before placing orders.
+        Prevents fatal single-leg execution failure (naked unhedged exposure).
+        Returns:
+            (passed: bool, final_pos_size: Decimal, reason: str)
+        """
+        if not getattr(self.config, "check_margin_before_entry", True):
+            return True, pos_size, "CHECK_DISABLED"
+
+        lev = Decimal(str(self.config.leverage))
+        buffer_ratio = getattr(self.config, "margin_buffer_ratio", Decimal("0.05"))
+        taker_fee = getattr(self.config, "taker_fee_rate", Decimal("0.0005"))
+        min_order_sz = getattr(self.config, "min_order_size_quote", Decimal("300.0"))
+        downsizing_enabled = getattr(self.config, "margin_aware_downsizing", True)
+
+        # -------------------------------------------------------------
+        # 1. Virtual Dry-Run Portfolio Wallet Check
+        # -------------------------------------------------------------
+        if self.config.dry_run:
+            virtual_total = getattr(self.config, "dry_run_virtual_balance_quote", Decimal("0.0"))
+            if virtual_total > Decimal("0.0"):
+                used_margin = sum(
+                    Decimal(str(p.get("total_margin", 0.0)))
+                    for p in self.active_basis_arbitrages.values()
+                )
+                dual_notional = pos_size * Decimal("2.0")
+                req_tot_margin = (dual_notional / lev if lev > 0 else dual_notional) * (Decimal("1.0") + buffer_ratio)
+                avail_virtual = virtual_total - used_margin
+                if avail_virtual < req_tot_margin:
+                    if downsizing_enabled:
+                        max_feasible = (avail_virtual / (Decimal("1.0") + buffer_ratio)) * lev / Decimal("2.0")
+                        if max_feasible >= min_order_sz:
+                            self.logger().info(
+                                f"🛡️ [VIRTUAL-MARGIN-DOWNSIZE] Token '{token}' virtual wallet sizing downsized "
+                                f"${float(pos_size):,.2f} -> ${float(max_feasible):,.2f} "
+                                f"(Avail: ${float(avail_virtual):,.2f} / Total: ${float(virtual_total):,.2f})"
+                            )
+                            return True, max_feasible, "VIRTUAL_DOWNSIZED"
+                    msg = (
+                        f"🛡️ [VIRTUAL-MARGIN-INTERCEPT] Token '{token}' entry blocked. "
+                        f"Required Total Margin: ${float(req_tot_margin):,.2f}, "
+                        f"Available Virtual Margin: ${float(avail_virtual):,.2f} (Total: ${float(virtual_total):,.2f}, Used: ${float(used_margin):,.2f})"
+                    )
+                    self.logger().info(msg)
+                    return False, Decimal("0"), "VIRTUAL_MARGIN_INSUFFICIENT"
+            # Unlimited dry run balance
+            return True, pos_size, "DRY_RUN_UNLIMITED"
+
+        # -------------------------------------------------------------
+        # 2. Live Real-Money Physical Connector Margin Gate
+        # -------------------------------------------------------------
+        avail_1, asset_1 = self.get_connector_available_collateral(c1, tp1)
+        avail_2, asset_2 = self.get_connector_available_collateral(c2, tp2)
+
+        # Margin multiplier per dollar of single-leg position size:
+        # Margin per leg = Notional / Leverage * (1 + buffer_ratio) + Notional * taker_fee
+        margin_factor = (Decimal("1.0") / lev if lev > 0 else Decimal("1.0")) * (Decimal("1.0") + buffer_ratio) + taker_fee
+        req_margin_1 = pos_size * margin_factor
+        req_margin_2 = pos_size * margin_factor
+
+        pass_1 = avail_1 >= req_margin_1
+        pass_2 = avail_2 >= req_margin_2
+
+        if pass_1 and pass_2:
+            return True, pos_size, "PASSED_FULL"
+
+        # Sizing shortage detected
+        if downsizing_enabled:
+            max_pos_1 = avail_1 / margin_factor if margin_factor > 0 else Decimal("0")
+            max_pos_2 = avail_2 / margin_factor if margin_factor > 0 else Decimal("0")
+            max_feasible = min(max_pos_1, max_pos_2)
+            if max_feasible >= min_order_sz:
+                self.logger().info(
+                    f"🛡️ [MARGIN-AWARE-DOWNSIZE] Token '{token}' target size ${float(pos_size):,.2f} downsized to "
+                    f"${float(max_feasible):,.2f} based on available margin. "
+                    f"Exchange 1 ({c1}): ${float(avail_1):,.2f} {asset_1} (supports ${float(max_pos_1):,.2f}), "
+                    f"Exchange 2 ({c2}): ${float(avail_2):,.2f} {asset_2} (supports ${float(max_pos_2):,.2f})."
+                )
+                return True, max_feasible, "MARGIN_DOWNSIZED"
+
+        # Hard Intercept
+        self.logger().warning(
+            f"🛡️ [INSUFFICIENT-MARGIN-INTERCEPT] Token '{token}' entry aborted to prevent single-leg fill naked exposure!\n"
+            f"  Exchange 1 ({c1}): Required ${float(req_margin_1):,.2f} {asset_1} | Available: ${float(avail_1):,.2f} {asset_1} -> {'✅ PASS' if pass_1 else '❌ INSUFFICIENT'}\n"
+            f"  Exchange 2 ({c2}): Required ${float(req_margin_2):,.2f} {asset_2} | Available: ${float(avail_2):,.2f} {asset_2} -> {'✅ PASS' if pass_2 else '❌ INSUFFICIENT'}\n"
+            f"  Minimum Order Size: ${float(min_order_sz):,.2f} (Required Margin: ${float(min_order_sz * margin_factor):,.2f})\n"
+            f"  Safety Cushion: {float(buffer_ratio):.1%} buffer + {float(taker_fee):.2%} taker fee withholding."
+        )
+        return False, Decimal("0"), "INSUFFICIENT_MARGIN"
+
     def create_actions_proposal(self) -> List[CreateExecutorAction]:
         """
         Evaluate if cross-exchange basis dislocation has opened up on any configured token.
@@ -1192,7 +1359,22 @@ class BasisStatArbitrage(StrategyV2Base):
                 self.entry_candidate_ticks[token] = 0
                 continue
 
-            # Confirmed Opportunity! Reset counter and enter
+            # Confirmed Opportunity! Check pre-flight margin availability on BOTH exchanges
+            margin_pass, final_pos_size, margin_reason = self._check_dual_exchange_margin_sufficiency(
+                token=token,
+                c1=c1,
+                tp1=tp1,
+                c1_exec_price=c1_exec_price,
+                c2=c2,
+                tp2=tp2,
+                c2_exec_price=c2_exec_price,
+                pos_size=pos_size,
+            )
+            if not margin_pass:
+                self.entry_candidate_ticks[token] = 0
+                continue
+
+            pos_size = final_pos_size
             self.entry_candidate_ticks[token] = 0
             # Sizing by uniform base token quantity (Coin-Neutral / Delta-Zero)
             # Ensures Leg 1 and Leg 2 hold strictly identical base coin amounts (Q1 == Q2)
@@ -2005,6 +2187,24 @@ class BasisStatArbitrage(StrategyV2Base):
         lines.append(f"  Position Sizing Matrix: 单边货值 ${pos_cfg:,.2f} | 双边总敞口 ${dual_cfg:,.2f} | 双边实缴保证金 ${margin_cfg:,.2f}")
         lines.append(f"  Dynamic Sizing: {'Enabled (Top3 Depth Cap)' if getattr(self.config, 'dynamic_capacity_sizing', True) else 'Disabled'} | Min Order: ${float(getattr(self.config, 'min_order_size_quote', Decimal('300.0'))):,.0f}")
         lines.append(f"  Executable VWAP Gates: Min Net Edge {float(getattr(self.config, 'min_executable_net_edge_pct', Decimal('0.0030'))):.2%} | Max Leg Slip {float(getattr(self.config, 'max_executable_depth_slippage_pct', Decimal('0.0025'))):.2%}")
+        margin_check_status = "Enabled" if getattr(self.config, "check_margin_before_entry", True) else "Disabled"
+        buf_pct = float(getattr(self.config, "margin_buffer_ratio", Decimal("0.05")))
+        downsizing_status = "Enabled" if getattr(self.config, "margin_aware_downsizing", True) else "Disabled"
+        lines.append(f"  Pre-Flight Margin Gate: {margin_check_status} (Buffer: {buf_pct:.1%}, Downsizing: {downsizing_status})")
+        if not self.config.dry_run and len(self.config.connectors) >= 2:
+            c1, c2 = list(self.config.connectors)[:2]
+            tp1_sample = self.get_trading_pair_for_connector("BTC", c1)
+            tp2_sample = self.get_trading_pair_for_connector("BTC", c2)
+            avail_1, asset_1 = self.get_connector_available_collateral(c1, tp1_sample)
+            avail_2, asset_2 = self.get_connector_available_collateral(c2, tp2_sample)
+            lines.append(f"  Live Available Balances: {c1}: ${float(avail_1):,.2f} {asset_1} | {c2}: ${float(avail_2):,.2f} {asset_2}")
+        else:
+            virt_tot = getattr(self.config, "dry_run_virtual_balance_quote", Decimal("0.0"))
+            if virt_tot > Decimal("0.0"):
+                used_m = sum(Decimal(str(p.get("total_margin", 0.0))) for p in self.active_basis_arbitrages.values())
+                lines.append(f"  Virtual Margin: Available ${float(virt_tot - used_m):,.2f} / Total ${float(virt_tot):,.2f} (Used: ${float(used_m):,.2f})")
+            else:
+                lines.append("  Virtual Margin: Unlimited Dry-Run")
         lines.append(f"  Active Positions: {len(self.active_basis_arbitrages)}")
         for tok, pos in self.active_basis_arbitrages.items():
             amt1 = float(pos.get("amount_1", float(pos["position_size"]) / float(pos["entry_price_1"]) if float(pos["entry_price_1"]) > 0 else 0.0))
