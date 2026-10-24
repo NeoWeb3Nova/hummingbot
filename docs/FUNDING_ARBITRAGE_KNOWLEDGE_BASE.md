@@ -1786,3 +1786,42 @@ $$Size_{quote} = \min\left(Size_{target}, \sum_{k=1}^{25} (P_k \times Q_k)_{c1} 
      - **自适应风控止损**：新增 `single_loss_quarantine_roe_pct` 参数（默认 2.0%），将单笔风控从绝对金额扩展至资本占用净收益率（ROE），兼顾百元小单与万元大单的动态风控自适应。
   6. **全面回归单元测试套件保障**：
      - `test_spot_perp_cash_carry.py` 全量扩展至 12 个测试用例，100% 覆盖倒挂止损抗噪、多周期补偿、精度对齐量化、滑点量纲、贴水拦截与保底逻辑，全套测试 100% 通过。
+
+
+---
+
+### 58. 从模拟 (Dry-Run) 迈向实盘 (Live Trading) 的全维接口审计与生产落地防线 (Case 58)
+- **业务背景与用户诉求**：
+  - 在完成 Paper 模拟盘阶段性 73 笔套利实战验证（净利润 +$23.12 USD，胜率 94.5%）后，系统面临从“虚拟模拟撮合”走向“真实资金实盘交易”的核心转折点。
+  - 用户核心关切：当前系统接口是否完备？能否直接将 `dry_run: false` 切换为实盘？若不能，应在哪些方面进行全面接入与生产加固？
+
+- **深度审计结论与核心红线（Executive Audit Verdict）**：
+  1. **能否直接切换？** ➔ **坚决不能（Hard Blocking No）**。
+     - 若盲目切换，系统将在启动阶段因未配置 Binance API Key / Hyperliquid Agent 钱包私钥而直接崩溃闪退；
+     - 即使填入假 Key，双边账户零余额将导致连续报单失败；
+     - 最关键的安全隐患：实盘环境具有异步失败特质。若 Binance 腿以市价成交，而 Hyperliquid 腿因最小货值（Min Notional < $10）、网络抖动或精度被拒，系统将暴露在 **100% 单向投机裸头寸（Naked Leg Exposure）** 的致命风险中。
+  2. **接口完备度**：
+     - **策略逻辑层**：95% 完备（已集成 `PositionExecutorConfig`、`CreateExecutorAction`、`StopExecutorAction` 与真实保证金查询），仅需补全**单腿成交失败即刻反向平仓熔断守护**；
+     - **连接器鉴权层**：官方连接器 `binance_perpetual` 与 `hyperliquid_perpetual` 代码级 100% 具备，但生产凭证与配置为空；
+     - **外部金融层**：未生成 Hyperliquid API Agent 钱包、未配置币安 IP 白名单与只读/交易权限、未进行双边抵押品 1:1 注资配平。
+
+- **必须完成的五大生产接入准备（The 5 Live Prerequisites）**：
+  1. **API 密钥拓扑安全隔离**：
+     - Binance：仅开启 Futures 交易权限，配置 VPS 固定公网 IP 白名单，**严禁开启提现（Withdrawals）**；
+     - Hyperliquid：通过 `https://app.hyperliquid.xyz/API` 生成专用 **API Agent 钱包私钥**，主钱包仅做 EIP-712 授权签名，严禁将主私钥填入服务器。
+  2. **交易所账户状态标定**：
+     - Binance 合约账户切换为 **单向持仓模式（One-Way Mode）**，清空所有挂单与历史残留碎片仓位。
+  3. **双边抵押品充值与精准配平**：
+     - Binance 充值 USDT，Hyperliquid 充值 USDC，双边按 1:1 注资（初期各 $50~$100 USD）；
+     - 预留 30% 浮动安全垫，保证金利用率严禁打满。
+  4. **交易规则与精度过滤底线**：
+     - 严格遵守 Hyperliquid $\ge \$10$ USD 与 Binance $\ge \$5$ USD 的最小下单货值限制；单笔名义货值设定为 $\$15.0$ USD；
+     - 下单前对代币数量向下截断至双方最严苛的 `step_size`。
+  5. **单腿成交熔断回滚守护 (Single-Leg Rollback Guard)**：
+     - 在执行器调度器中监控两腿状态，若 2000ms 内一腿成功一腿被拒，立即向已成交腿发出市价反向平仓单，杜绝单腿裸奔。
+
+- **落地 SOP 三步走路线图**：
+  - **阶段一（当前已达成）**：Paper 模拟盘（$1,000 虚拟本金，48 个代币池，验证基差收敛与 60s 防噪锁定理）；
+  - **阶段二（关键过渡）**：微额影子实盘（Micro-Live，双边本金各 $50~$100，单笔货值 $15，仅跑 SOL/ETH 主流标的，跑满 20 笔真实对账）；
+  - **阶段三（正式生产）**：按需扩充资金与代币池，配合 VPS Headless 无头模式后台稳态运行。
+  - **专题落地指南**：详见独立深度指引 [`docs/LIVE_TRADING_READINESS_GUIDE.md`](file:///home/neo/projects/hummingbot/docs/LIVE_TRADING_READINESS_GUIDE.md)。
