@@ -1649,3 +1649,27 @@ $$Size_{quote} = \min\left(Size_{target}, \sum_{k=1}^{25} (P_k \times Q_k)_{c1} 
 - **架构决策终局**：
   - 维持当前 60 秒最小持仓时间锁定不变，不盲目过拟合修改代码；
   - 这一机制经过 74 笔全景验证，不仅不是枷锁，反而是系统维持 90.5% 极高胜率、54.4% 超高 Alpha 留存率的核心基石。
+
+
+---
+
+### 54. 真实平仓失败金额深度归集与风控透视看板（Realized Losses Aggregation & Risk Transparency）
+- **业务诉求与量化痛点**：
+  - 在此前落地“全摩擦穿透值（手续费 + L2 深度滑点 + 网络时延跳价）”后，账户毛利与摩擦损耗已实现毫厘级穿透；
+  - 但对于机构化风控而言，仍需一眼看穿**“真正失败订单的累计亏损金额是多少？单均亏损是多少？最大回撤来自哪里？盈亏金额比（Profit Factor）是多少？”**，杜绝亏损金额隐没在总净利或胜率数字中；
+- **全链路四大归集与透视升级**：
+  1. **顶部核心 KPI 指标卡新增第 4 维核心风控卡片**：
+     - 指标名：`🛑 真实平仓失败归集`
+     - 主数值：累计平仓失败净亏损（如 `-$14.13 USD`）；
+     - 副标签：`{失败笔数} 笔失败 | 均亏 -${单均} (盈亏比 {Profit Factor}:1)`；
+     - 帮助提示（Tooltip）：穿透展示发散止损损失、移动保底回撤损失、最大单笔亏损与盈亏金额比；
+  2. **战绩总览横幅（Performance Strip）五维平衡陈列**：
+     - 在“穿透结清真实纯利”与“单笔平均实缴 ROE”之间，无缝嵌入`真实失败金额归集`模块，红绿分明，盈亏对照；
+  3. **“仅看亏损”模式唤醒专属复盘大屏**：
+     - 当用户在过滤器中勾选`🔴 仅看亏损`时，页面自动在对账单卡片与大表上方渲染**“🔴 真实失败订单全维归集与复盘看板”**，直观汇总累计亏损、失败原因分布（紧急发散止损 vs 移动止盈回撤/保底）与涉及标的损失排行；
+  4. **Analytics 图表透视新增宏观资金损益流向与风控归因图**：
+     - **图表 3**：`🛑 真实平仓失败原因与损耗归集`（各止损原因造成的绝对损失柱状图）；
+     - **图表 4**：`⚖️ 宏观资金损益流向`（总胜单毛利 vs 全摩擦损耗 vs 总失败亏损 vs 最终到手纯利 全景资金瀑布流）。
+- **工程落地与测试保障**：
+  - 核心文件：[`hummingbot-dashboard/frontend/components/basis_stat_arb_view.py`](file:///home/neo/projects/hummingbot/hummingbot-dashboard/frontend/components/basis_stat_arb_view.py)；
+  - 单元测试：[`hummingbot-dashboard/test/test_basis_stat_arb.py`](file:///home/neo/projects/hummingbot/hummingbot-dashboard/test/test_basis_stat_arb.py) 新增 `TestRealizedLossAggregation`，32 个用例 100% 通过（涵盖空记录零除防御与全量指标对账）。
