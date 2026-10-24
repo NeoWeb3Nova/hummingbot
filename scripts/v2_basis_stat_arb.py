@@ -1384,6 +1384,22 @@ class BasisStatArbitrage(StrategyV2Base):
                     else:
                         continue
 
+                    # Meat-on-the-bone Gate:
+                    # Verify remaining executable edge is comfortably higher than take-profit target
+                    # If spread has already compressed past TP, mean reversion already completed!
+                    min_sniper_edge = getattr(self.config, "sniper_take_profit_basis_pct", Decimal("0.0035")) + Decimal("0.0010")
+                    if s_spread < min_sniper_edge:
+                        self.logger().info(
+                            f"🎯 [SNIPER-OPPORTUNITY-VANISHED] Executable basis for '{s_tok}' already contracted to {float(s_spread):+.2%}, "
+                            f"below viable sniper entry threshold ({float(min_sniper_edge):.2%}). Opportunity completed without entry."
+                        )
+                        del self.sniper_prey_tracker[s_tok]
+                        continue
+
+                    # Query Top 3 OrderBook depth for accurate reporting
+                    _, top3_c1 = self.get_orderbook_depth_summary(c1, tp1, is_buy=(s_c1_side == TradeType.BUY), top_n=3)
+                    _, top3_c2 = self.get_orderbook_depth_summary(c2, tp2, is_buy=(s_c2_side == TradeType.BUY), top_n=3)
+
                     # Margin check for sniper order
                     margin_pass, final_sz, margin_reason = self._check_dual_exchange_margin_sufficiency(
                         token=s_tok, c1=c1, tp1=tp1, c1_exec_price=s_c1_exec,
@@ -1453,8 +1469,8 @@ class BasisStatArbitrage(StrategyV2Base):
                         "target_compression_pct": float(getattr(self.config, "sniper_take_profit_basis_pct", Decimal("0.0035"))),
                         "position_size": float(sniper_sz),
                         "safe_capacity": float(sniper_sz),
-                        "top3_depth_1": 0.0,
-                        "top3_depth_2": 0.0,
+                        "top3_depth_1": float(top3_c1),
+                        "top3_depth_2": float(top3_c2),
                         "net_executable_edge_pct": float(s_spread),
                         "entry_depth_slip_pct_1": float(s_c1_slip),
                         "entry_depth_slip_pct_2": float(s_c2_slip),
@@ -1511,6 +1527,34 @@ class BasisStatArbitrage(StrategyV2Base):
             # Optimization 2: Toxic Token Quarantine check (divergence defense)
             quarantine_until = self.quarantine_tokens.get(token, 0.0)
             if self.current_timestamp < quarantine_until:
+                # Quarantined tokens are strictly forbidden from normal entries (0.50% ~ 1.49%)
+                # But if extreme dislocation occurs (>= 1.50%), enroll in Sniper Prey Tracker:
+                if getattr(self.config, "sniper_mode_enabled", True) and token not in self.sniper_prey_tracker:
+                    tp1 = self.get_trading_pair_for_connector(token, c1)
+                    tp2 = self.get_trading_pair_for_connector(token, c2)
+                    p1_ind = self.get_indicative_price(c1, tp1)
+                    p2_ind = self.get_indicative_price(c2, tp2)
+                    if p1_ind and p2_ind and p1_ind > 0 and p2_ind > 0:
+                        m1 = Decimal(str(self.get_token_multiplier(token, c1)))
+                        m2 = Decimal(str(self.get_token_multiplier(token, c2)))
+                        p1_n = p1_ind / m1
+                        p2_n = p2_ind / m2
+                        ind_basis = abs(p1_n - p2_n) / min(p1_n, p2_n)
+                        if ind_basis >= getattr(self.config, "sniper_trigger_basis_pct", Decimal("0.0150")):
+                            self.sniper_prey_tracker[token] = {
+                                "token": token,
+                                "source": "QUARANTINE_EXTREME_SCAN",
+                                "initial_trigger_ts": self.current_timestamp,
+                                "peak_basis": float(ind_basis),
+                                "peak_ts": self.current_timestamp,
+                                "consecutive_contraction_ticks": 0,
+                                "last_basis": float(ind_basis),
+                                "status": "TRACKING_PEAK",
+                            }
+                            self.logger().info(
+                                f"🎯 [QUARANTINE-SNIPER-ENROLLED] Quarantined token '{token}' exhibiting extreme basis ({float(ind_basis):.2%}). "
+                                f"Enrolled in Sniper Prey Tracker for right-side reversal!"
+                            )
                 continue
             elif token in self.quarantine_tokens:
                 del self.quarantine_tokens[token]
@@ -2092,7 +2136,16 @@ class BasisStatArbitrage(StrategyV2Base):
                 sniper_tp_thresh = getattr(self.config, "sniper_take_profit_basis_pct", Decimal("0.0035"))
                 sniper_stop_basis = Decimal(str(pos.get("sniper_stop_basis", 0.0250)))
                 sniper_tp_raw = (abs(curr_basis) <= sniper_tp_thresh or net_pnl_pct >= self.config.min_take_profit_net_pct) and total_net_pnl > 0
-                sniper_sl_raw = (abs(curr_basis) >= sniper_stop_basis)
+                
+                # Direction-aware adverse breakout check:
+                # If side_1 == "SELL" (Short C1 / Long C2): adverse expansion is C1 getting higher (curr_basis >= sniper_stop_basis)
+                # If side_1 == "BUY" (Long C1 / Short C2): adverse expansion is C2 getting higher (curr_basis <= -sniper_stop_basis)
+                side_1_str = pos.get("side_1", "SELL")
+                if side_1_str == "SELL":
+                    is_adverse_breakout = curr_basis >= sniper_stop_basis
+                else:
+                    is_adverse_breakout = curr_basis <= -sniper_stop_basis
+                sniper_sl_raw = is_adverse_breakout and (total_net_pnl < Decimal("0"))
                 is_sniper_eligible = (duration_s >= 5)
                 sniper_exit_candidate = is_sniper_eligible and (sniper_tp_raw or sniper_sl_raw)
             else:
