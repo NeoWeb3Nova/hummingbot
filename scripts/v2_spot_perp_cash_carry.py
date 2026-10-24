@@ -18,6 +18,8 @@ from hummingbot.core.data_type.order_candidate import OrderCandidate, PerpetualO
 from hummingbot.core.event.events import BuyOrderCompletedEvent, FundingPaymentCompletedEvent, SellOrderCompletedEvent
 from hummingbot.core.rate_oracle.rate_oracle import RateOracle
 from hummingbot.strategy.strategy_v2_base import StrategyV2Base, StrategyV2ConfigBase
+from hummingbot.strategy_v2.executors.position_executor.data_types import PositionExecutorConfig, TripleBarrierConfig
+from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, StopExecutorAction
 
 
 class SpotPerpCashCarryConfig(StrategyV2ConfigBase):
@@ -82,9 +84,9 @@ class SpotPerpCashCarryConfig(StrategyV2ConfigBase):
         }
     )
     inversion_exit_apr: Decimal = Field(
-        default=Decimal("0.00"),
+        default=Decimal("-0.05"),
         json_schema_extra={
-            "prompt": lambda mi: "Emergency exit threshold when funding turns adverse/negative (e.g. 0.00): ",
+            "prompt": lambda mi: "Emergency exit threshold when funding turns adverse/negative (e.g. -0.05 for -5% APR): ",
             "prompt_on_new": False,
         }
     )
@@ -157,6 +159,7 @@ class SpotPerpCashCarryConfig(StrategyV2ConfigBase):
     # --- Toxic Token Quarantine & Risk Controls ---
     token_quarantine_hours: float = Field(default=24.0)
     single_loss_quarantine_threshold: Decimal = Field(default=Decimal("10.0"))
+    single_loss_quarantine_roe_pct: Decimal = Field(default=Decimal("0.020"))
     liquidation_buffer_pct: Decimal = Field(default=Decimal("0.15"))
     min_holding_seconds: int = Field(default=3600)
     max_hold_hours: float = Field(default=168.0)
@@ -374,6 +377,60 @@ class SpotPerpCashCarryStrategy(StrategyV2Base):
         except Exception:
             return Decimal("0")
 
+    def is_funding_ready(self, connector_name: str, trading_pair: str) -> bool:
+        """Check if funding info is genuinely ready and non-corrupt."""
+        f_info = self.get_safe_funding_info(connector_name, trading_pair)
+        if not f_info or getattr(f_info, "rate", None) is None:
+            return False
+        try:
+            rate = Decimal(str(f_info.rate))
+            return abs(rate) <= Decimal("0.05")
+        except Exception:
+            return False
+
+    def quantize_order_amount(
+        self, token: str, raw_amount: Decimal, p_spot: Decimal, p_perp: Decimal
+    ) -> Optional[Decimal]:
+        """
+        Quantizes base coin amount strictly conforming to both Spot and Perp exchange trading rules.
+        Ensures perfect coin-neutral delta (Delta_base = 0) and meets minimum notional on both legs.
+        """
+        c_spot = self.config.spot_connector
+        c_perp = self.config.perp_connector
+        tp_spot = self.get_trading_pair_for_connector(token, c_spot)
+        tp_perp = self.get_trading_pair_for_connector(token, c_perp)
+
+        conn_spot = self.connectors.get(c_spot)
+        conn_perp = self.connectors.get(c_perp)
+        if not conn_spot or not conn_perp:
+            return raw_amount
+
+        amt = raw_amount
+        try:
+            amt = conn_spot.quantize_order_amount(tp_spot, amt)
+            amt = conn_perp.quantize_order_amount(tp_perp, amt)
+        except Exception:
+            pass
+
+        rules_spot = getattr(conn_spot, "trading_rules", {}).get(tp_spot) if isinstance(getattr(conn_spot, "trading_rules", None), dict) else None
+        rules_perp = getattr(conn_perp, "trading_rules", {}).get(tp_perp) if isinstance(getattr(conn_perp, "trading_rules", None), dict) else None
+
+        min_sz_spot = getattr(rules_spot, "min_order_size", None)
+        if isinstance(min_sz_spot, (Decimal, int, float)) and amt < Decimal(str(min_sz_spot)):
+            return None
+        min_sz_perp = getattr(rules_perp, "min_order_size", None)
+        if isinstance(min_sz_perp, (Decimal, int, float)) and amt < Decimal(str(min_sz_perp)):
+            return None
+
+        min_notional_spot = getattr(rules_spot, "min_notional_size", None)
+        if isinstance(min_notional_spot, (Decimal, int, float)) and amt * p_spot < Decimal(str(min_notional_spot)):
+            return None
+        min_notional_perp = getattr(rules_perp, "min_notional_size", None)
+        if isinstance(min_notional_perp, (Decimal, int, float)) and amt * p_perp < Decimal(str(min_notional_perp)):
+            return None
+
+        return amt if amt > Decimal("0") else None
+
     # =========================================================================
     # Multi-Tier Asset Classification & Risk Controls
     # =========================================================================
@@ -429,7 +486,7 @@ class SpotPerpCashCarryStrategy(StrategyV2Base):
 
         min_depth = min(depth_spot, depth_perp)
         safe_capacity = min_depth * self.config.max_orderbook_depth_ratio
-        target = min(tier_max, safe_capacity)
+        target = min(base_size, safe_capacity)
         return max(self.config.min_position_size_quote, target)
 
     def calculate_friction_and_payback(
@@ -490,57 +547,88 @@ class SpotPerpCashCarryStrategy(StrategyV2Base):
                 continue
 
             next_f = pos.get("next_funding_time", 0)
-            if now >= next_f and next_f > 0:
+            if next_f <= 0:
+                pos["next_funding_time"] = int(now + 3600)
+                continue
+
+            if now >= next_f:
                 perp_conn_name = pos["perp_connector"]
                 tp = self.get_trading_pair_for_connector(token, perp_conn_name)
                 raw_rate = self.get_safe_funding_rate_1h(perp_conn_name, tp)
-
                 notional = Decimal(str(pos["position_size"]))
-                # Short receives when rate > 0
-                cashflow = notional * raw_rate
 
-                pos["settled_funding_pnl"] = float(Decimal(str(pos.get("settled_funding_pnl", 0.0))) + cashflow)
-                pos.setdefault("funding_payments", []).append({
-                    "timestamp": int(now),
-                    "connector": perp_conn_name,
-                    "rate": float(raw_rate),
-                    "notional": float(notional),
-                    "amount": float(cashflow),
-                })
+                # Calculate number of elapsed 1-hour cycles (bounded to max 168h to avoid runaway)
+                elapsed_cycles = min(168, max(1, int((now - next_f) // 3600) + 1))
+                single_cashflow = notional * raw_rate
+                total_cashflow = single_cashflow * Decimal(str(elapsed_cycles))
 
-                # Schedule next 1-hour settlement
-                pos["next_funding_time"] = int(now + 3600)
+                pos["settled_funding_pnl"] = float(Decimal(str(pos.get("settled_funding_pnl", 0.0))) + total_cashflow)
+                for c_idx in range(elapsed_cycles):
+                    cycle_ts = next_f + (c_idx * 3600)
+                    pos.setdefault("funding_payments", []).append({
+                        "timestamp": int(cycle_ts),
+                        "connector": perp_conn_name,
+                        "rate": float(raw_rate),
+                        "notional": float(notional),
+                        "amount": float(single_cashflow),
+                    })
+
+                # Schedule next 1-hour settlement in future
+                pos["next_funding_time"] = int(next_f + (elapsed_cycles * 3600))
                 self.logger().info(
                     f"💳 [FUNDING-PAYMENT-SETTLED] Token '{token}' on {perp_conn_name}: "
-                    f"Rate {float(raw_rate):+.4%} ➔ Received ${float(cashflow):+,.4f} USDC. "
+                    f"Rate {float(raw_rate):+.4%} x {elapsed_cycles} cycle(s) ➔ Received ${float(total_cashflow):+,.4f} USDC. "
                     f"Cumulative Funding: ${pos['settled_funding_pnl']:+,.4f}"
                 )
                 self._persist_state()
+
+    def did_complete_funding_payment(self, event: FundingPaymentCompletedEvent):
+        """Live event listener for exchange-confirmed discrete funding payments."""
+        token = event.trading_pair.split("-")[0]
+        pos = self.active_positions.get(token)
+        if not pos or pos.get("is_virtual", True):
+            return
+
+        payment_amount = Decimal(str(event.amount))
+        pos["settled_funding_pnl"] = float(Decimal(str(pos.get("settled_funding_pnl", 0.0))) + payment_amount)
+        pos.setdefault("funding_payments", []).append({
+            "timestamp": int(event.timestamp),
+            "connector": getattr(event, "connector_name", self.config.perp_connector),
+            "rate": float(getattr(event, "funding_rate", Decimal("0"))),
+            "notional": float(pos["position_size"]),
+            "amount": float(payment_amount),
+        })
+        self.logger().info(
+            f"💳 [LIVE-FUNDING-EVENT] Token '{token}' received live funding payment: ${float(payment_amount):+,.4f} USDC. "
+            f"Total Settled: ${pos['settled_funding_pnl']:+,.4f}"
+        )
+        self._persist_state()
 
     # =========================================================================
     # Entry Proposals: Long Spot + Short Perp
     # =========================================================================
 
-    def create_actions_proposal(self) -> List:
+    def create_actions_proposal(self) -> List[CreateExecutorAction]:
         """Evaluate watchlist candidates and propose Spot-Perp Cash & Carry entries."""
+        create_actions = []
         if len(self.active_positions) >= self.config.max_concurrent_tokens:
-            return []
+            return create_actions
 
         # 1. Hourly Blackout Window Check (:58 ~ :01)
         if self.is_in_hourly_blackout():
-            return []
+            return create_actions
 
         c_spot = self.config.spot_connector
         c_perp = self.config.perp_connector
         conn_spot = self.connectors.get(c_spot)
         conn_perp = self.connectors.get(c_perp)
         if not conn_spot or not conn_perp:
-            return []
+            return create_actions
 
         # Available slot budget check
         available_slots = self.config.max_concurrent_tokens - len(self.active_positions)
         if available_slots <= 0:
-            return []
+            return create_actions
 
         allocated_slots = len(self.active_positions)
 
@@ -631,10 +719,19 @@ class SpotPerpCashCarryStrategy(StrategyV2Base):
                 )
                 continue
 
-            # 7. Execute Entry
-            coin_amount = pos_size / p_spot_exec
-            perp_margin = pos_size / Decimal(str(self.config.perp_leverage))
-            total_capital = pos_size + perp_margin
+            # 7. Execute Entry & Quantize Order Amount strictly
+            raw_coin_amount = pos_size / p_spot_exec
+            quantized_amt = self.quantize_order_amount(token, raw_coin_amount, p_spot_exec, p_perp_exec)
+            if quantized_amt is None or quantized_amt <= Decimal("0"):
+                self.logger().warning(f"⚠️ [SIZING] Token '{token}' size ${float(pos_size)} fails exchange trading rules or min notional.")
+                self.entry_candidate_ticks[token] = 0
+                continue
+
+            coin_amount = quantized_amt
+            spot_notional = coin_amount * p_spot_exec
+            perp_notional = coin_amount * p_perp_exec
+            perp_margin = perp_notional / Decimal(str(self.config.perp_leverage))
+            total_capital = spot_notional + perp_margin
             est_liq_price = p_perp_exec * (Decimal("1.0") + (Decimal("1.0") / Decimal(str(self.config.perp_leverage))) - Decimal("0.03"))
 
             pos_data = {
@@ -646,13 +743,13 @@ class SpotPerpCashCarryStrategy(StrategyV2Base):
                 "spot_trading_pair": tp_spot,
                 "perp_trading_pair": tp_perp,
                 "amount": float(coin_amount),
-                "position_size": float(pos_size),
+                "position_size": float(spot_notional),
                 "perp_leverage": self.config.perp_leverage,
                 "spot_entry_price": float(p_spot_exec),
                 "perp_entry_price": float(p_perp_exec),
                 "entry_basis_pct": float(basis_spread),
                 "entry_apr": float(annual_apr),
-                "spot_margin": float(pos_size),
+                "spot_margin": float(spot_notional),
                 "perp_margin": float(perp_margin),
                 "total_margin": float(total_capital),
                 "estimated_liq_price": float(est_liq_price),
@@ -666,27 +763,58 @@ class SpotPerpCashCarryStrategy(StrategyV2Base):
                 "partial_tp_done": False,
             }
 
-            self.active_positions[token] = pos_data
+            if self.config.dry_run:
+                self.active_positions[token] = pos_data
+            else:
+                exec_spot = PositionExecutorConfig(
+                    timestamp=self.current_timestamp,
+                    connector_name=c_spot,
+                    trading_pair=tp_spot,
+                    side=TradeType.BUY,
+                    entry_price=p_spot_exec,
+                    amount=coin_amount,
+                    leverage=1,
+                    triple_barrier_config=TripleBarrierConfig(open_order_type=OrderType.MARKET),
+                )
+                exec_perp = PositionExecutorConfig(
+                    timestamp=self.current_timestamp,
+                    connector_name=c_perp,
+                    trading_pair=tp_perp,
+                    side=TradeType.SELL,
+                    entry_price=p_perp_exec,
+                    amount=coin_amount,
+                    leverage=self.config.perp_leverage,
+                    triple_barrier_config=TripleBarrierConfig(open_order_type=OrderType.MARKET),
+                )
+                pos_data["is_virtual"] = False
+                pos_data["executors_ids"] = [exec_spot.id, exec_perp.id]
+                self.active_positions[token] = pos_data
+                create_actions.extend([
+                    CreateExecutorAction(executor_config=exec_spot),
+                    CreateExecutorAction(executor_config=exec_perp),
+                ])
+
             allocated_slots += 1
             self.entry_candidate_ticks[token] = 0
             self.logger().info(
                 f"🚀 [SPOT-PERP-ENTRY-TRIGGER] Token '{token}' (Tier {pos_data['tier']}) Cash & Carry Activated!\n"
-                f"  Leg 1 (Spot {c_spot}): BUY {float(coin_amount):,.4f} {token} @ ${float(p_spot_exec):.4f} (Notional ${float(pos_size):,.2f})\n"
+                f"  Leg 1 (Spot {c_spot}): BUY {float(coin_amount):,.4f} {token} @ ${float(p_spot_exec):.4f} (Notional ${float(spot_notional):,.2f})\n"
                 f"  Leg 2 (Perp {c_perp}): SHORT {float(coin_amount):,.4f} {token} @ ${float(p_perp_exec):.4f} (Margin ${float(perp_margin):,.2f}, {self.config.perp_leverage}x)\n"
                 f"  Funding Yield: Annualized APR {float(annual_apr):+.1%} (Daily {float(daily_rate):+.2%})\n"
                 f"  Friction & Payback: Payback {float(payback_hours):.1f}h (Basis: {float(basis_spread):+.2%}, Liq Price: ${float(est_liq_price):.4f}, Buffer: {float(tier_liq_buffer):.1%})"
             )
             self._persist_state()
 
-        return []
+        return create_actions
 
     # =========================================================================
     # Exit Proposals: Sell Spot + Buy to Close Perp Short
     # =========================================================================
 
-    def stop_actions_proposal(self) -> List:
+    def stop_actions_proposal(self) -> List[StopExecutorAction]:
         """Evaluate active spot-perp positions and close when exit conditions met."""
         tokens_to_close = []
+        stop_actions = []
         c_spot = self.config.spot_connector
         c_perp = self.config.perp_connector
         conn_spot = self.connectors.get(c_spot)
@@ -845,8 +973,14 @@ class SpotPerpCashCarryStrategy(StrategyV2Base):
                 continue
 
             # ----------------- Exit Conditions -----------------
-            # 1. Rate Inversion Stop (funding turned negative)
-            is_inverted = curr_apr <= self.config.inversion_exit_apr
+            # 1. Rate Inversion Stop (funding turned genuinely negative/adverse)
+            # Ensure data is valid, strictly below inversion threshold, and strictly negative
+            is_inverted = (
+                rate_1h is not None and
+                self.is_funding_ready(c_perp, tp_perp) and
+                curr_apr < self.config.inversion_exit_apr and
+                curr_apr < Decimal("0.0")
+            )
 
             # 2. Funding Yield Decay Exit (APR dropped below exit threshold & min holding passed)
             is_decayed = (curr_apr < self.config.exit_annualized_apr) and (duration_s >= self.config.min_holding_seconds)
@@ -908,8 +1042,15 @@ class SpotPerpCashCarryStrategy(StrategyV2Base):
             pos = self.active_positions.pop(token)
             self.token_last_closed_ts[token] = self.current_timestamp
 
-            # Quarantine toxic token if liquidated or heavy loss
-            if item["is_liq_danger"] or item["total_net_pnl"] < -float(self.config.single_loss_quarantine_threshold):
+            # Stop live executors if running in live mode
+            if not self.config.dry_run:
+                for eid in pos.get("executors_ids", []):
+                    stop_actions.append(StopExecutorAction(executor_id=eid))
+
+            # Quarantine toxic token if liquidated, heavy dollar loss, or heavy ROE loss
+            loss_limit = -float(self.config.single_loss_quarantine_threshold)
+            roe_loss_limit = -float(self.config.single_loss_quarantine_roe_pct)
+            if item["is_liq_danger"] or item["total_net_pnl"] < loss_limit or item["roe_pct"] < roe_loss_limit:
                 self.quarantine_token(token, self.config.token_quarantine_hours, item["reason"])
 
             record = {
@@ -961,7 +1102,7 @@ class SpotPerpCashCarryStrategy(StrategyV2Base):
         if tokens_to_close:
             self._persist_state()
 
-        return []
+        return stop_actions
 
     # =========================================================================
     # Universe Scanner & Dynamic Hot-Swap
@@ -1006,9 +1147,15 @@ class SpotPerpCashCarryStrategy(StrategyV2Base):
                 tier_max_quote, tier_min_apr, tier_liq_buf = self.get_tier_config(tok)
                 safe_size = self.calculate_position_size(tok, depth_spot, depth_perp)
 
-                if p_spot and p_perp:
+                p_spot_b, _, p_spot_exec, p_spot_slip = self.get_orderbook_execution_metrics(c_spot, tp_spot, is_buy=True, quote_volume=safe_size)
+                p_perp_b, _, p_perp_exec, p_perp_slip = self.get_orderbook_execution_metrics(c_perp, tp_perp, is_buy=False, quote_volume=safe_size)
+
+                p_spot_val = p_spot_exec or p_spot or p_spot_b
+                p_perp_val = p_perp_exec or p_perp or p_perp_b
+
+                if p_spot_val and p_perp_val:
                     basis_spread, total_friction, payback_h, is_payback_ok = self.calculate_friction_and_payback(
-                        p_spot, p_perp, None, None, rate_1h
+                        p_spot_val, p_perp_val, p_spot_slip, p_perp_slip, rate_1h
                     )
                 else:
                     basis_spread, total_friction, payback_h, is_payback_ok = basis, Decimal("0.0035"), Decimal("999.0"), False
@@ -1202,8 +1349,10 @@ class SpotPerpCashCarryStrategy(StrategyV2Base):
         for path in self.data_file_candidates:
             try:
                 os.makedirs(os.path.dirname(path), exist_ok=True)
-                with open(path, "w") as f:
+                tmp_path = f"{path}.tmp.{os.getpid()}"
+                with open(tmp_path, "w") as f:
                     json.dump(data, f, indent=2)
+                os.replace(tmp_path, path)
                 break
             except Exception:
                 pass

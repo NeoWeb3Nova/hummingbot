@@ -1751,3 +1751,38 @@ $$Size_{quote} = \min\left(Size_{target}, \sum_{k=1}^{25} (P_k \times Q_k)_{c1} 
      - 对 `spot_perp_cash_carry_trades.json` 进行对账平反：REZ 摩擦损耗由 $127.46 纠正为真实值 $1.85，净收益纠正为 -$3.43（真实 ROE -0.51%），解除 REZ 误隔离状态。
   7. **自动化回归测试套件沉淀**：
      - 在 `test/test_spot_perp_cash_carry.py` 中新增 `TestSpotPerpBugRegressions` 测试集，覆盖滑点量纲缩放、贴水拦截、KeyError 兜底与负 ROE 保底防护，9 大用例全部通过。
+
+
+---
+
+### 57. 现货-期货资金费套利策略工业级全面重构——StrategyV2 双轨执行、倒挂抗噪防线与 Delta 零漂移量化对齐 (Case 57) (v2.6.0)
+- **业务背景与工业级演进诉求**：
+  - 在完成 Case 56 故障深度复盘后，为了将 `v2_spot_perp_cash_carry.py` 由“仅支持模拟撮合与易受网络/初始化抖动误伤的原型脚本”，升级为具备“实盘与模拟双轨无缝切换、多周期离散资金费自动补齐、交易所精细精度对齐与绝对抗噪防线”的工业级量化策略，进行了全方位、专业视角的系统性迭代。
+
+- **五大核心优化与架构升级（The Five Pillars of Institutional Hardening）**：
+  1. **费率倒挂抗噪防线（Funding Rate Inversion Anti-Noise Barrier）**：
+     - **发现漏洞**：旧版本将倒挂止损阈值硬编码为 `inversion_exit_apr: Decimal = 0.00`，且判断逻辑为 `<= 0.00`。当策略启动、交易所网络连接初建或行情处于短暂费率真空期（Funding Rate = 0.00%）时，系统立刻误判为“费率严重倒挂”，在短短 2 个 Tick（2 秒）内将所有正常持仓全数恐慌清仓！
+     - **重构落实**：
+       * 阈值调正：将 `inversion_exit_apr` 默认值设为 `-0.05`（-5% APR，相当于日费率约 -0.014%）；
+       * 逻辑加固：增加 `is_funding_ready` 有效性校验与 `curr_apr < Decimal("0.0")` 硬性负值判断；当费率为 0.0% 或未就绪时，坚决不触发倒挂止损，彻底封堵冷启动误斩仓漏洞。
+  2. **StrategyV2 真实实盘执行引擎支持（Dual-Mode Live Executor Engine）**：
+     - **发现漏洞**：旧版本仅包含虚拟账本逻辑，当用户在配置中关闭 `dry_run`（`dry_run: false`）时，系统只在内存和 JSON 记录虚拟状态，从未真正向 Binance 或 Hyperliquid 下单！
+     - **重构落实**：
+       * 引入 Hummingbot StrategyV2 标准执行器：`PositionExecutorConfig`、`TripleBarrierConfig`、`CreateExecutorAction` 与 `StopExecutorAction`；
+       * 开仓双腿原子发起：Leg 1 现货发起 `TradeType.BUY`（leverage=1），Leg 2 合约发起 `TradeType.SELL`（leverage=3）；
+       * 平仓双腿联动终止：在 `stop_actions_proposal` 中针对已激活的 `executors_ids` 发起 `StopExecutorAction`，实现模拟与实盘真实交易的一体化无缝对接。
+  3. **交易所交易规则与 Delta 零漂移量化对齐（Coin-Neutral Quantization & Delta Zero Alignment）**：
+     - **量化隐患**：现货与合约的最小下单量（`min_order_size`）、最小步长（`step_size`）与最小名义货值（`min_notional_size`）存在差异。若直接使用浮点数除法计算基础币数量，实盘下单必报 `LOT_SIZE Filter failure`，且两腿数量微幅差异会导致现货-合约 $\Delta \neq 0$（产生非对称裸敞口风险）。
+     - **重构落实**：
+       * 新增 `quantize_order_amount` 统一精度量化器：同时获取现货与合约连接器的 `trading_rules`，以双方中最严苛的精度步长向下取整，并校验两腿名义价值均满足交易所底线；
+       * 确保对冲两腿的基础资产数量严格等额，从源头确保 $\Delta_{base} = 0.00000000$ 绝对币本位中性。
+  4. **离散时点资金费断线跨周期自动补偿机制（Multi-Cycle Discrete Funding Catch-up）**：
+     - **机制痛点**：Hyperliquid 永续合约每 1 小时（3600 秒）离散结清一次资金费。若程序因网络故障、实例维护重启掉线数小时，旧版本仅在重启后处理单次结算，导致离线期间应收取的数期资金费现金流漏记。
+     - **重构落实**：
+       * 增强 `account_for_discrete_funding_settlements`：自动计算掉线期间跨越的离散周期数 `elapsed_cycles = min(168, max(1, (now - next_f) // 3600 + 1))`，完整补齐各周期的资金费入账记录，并将下次结算时间严格对齐到未来的下一个正点小时；
+       * 新增 `did_complete_funding_payment` 事件监听器，实盘模式下直接捕获交易所推送的真实 `FundingPaymentCompletedEvent` 事件入账。
+  5. **原子化文件落盘与全维风控扩展（Atomic Disk Persistence & Adaptive Quarantine）**：
+     - **I/O 安全防线**：使用临时文件加 `os.replace` 的原子级落盘替换机制，彻底根除高频读写下 Streamlit 前端读取到半写入 JSON 文件的解析崩溃风险；
+     - **自适应风控止损**：新增 `single_loss_quarantine_roe_pct` 参数（默认 2.0%），将单笔风控从绝对金额扩展至资本占用净收益率（ROE），兼顾百元小单与万元大单的动态风控自适应。
+  6. **全面回归单元测试套件保障**：
+     - `test_spot_perp_cash_carry.py` 全量扩展至 12 个测试用例，100% 覆盖倒挂止损抗噪、多周期补偿、精度对齐量化、滑点量纲、贴水拦截与保底逻辑，全套测试 100% 通过。
