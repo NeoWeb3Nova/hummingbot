@@ -1701,3 +1701,53 @@ $$Size_{quote} = \min\left(Size_{target}, \sum_{k=1}^{25} (P_k \times Q_k)_{c1} 
        * 启用 `chrony` 高精度原子钟授时（确保时差 <= 10ms，杜绝币安 `recvWindow` 致命拒单）。
 - **配套工程文档落盘**：
   - 完整 SOP 与自检清单已同步沉淀至 [`docs/VPS_PRODUCTION_DEPLOYMENT_GUIDE.md`](file:///home/neo/projects/hummingbot/docs/VPS_PRODUCTION_DEPLOYMENT_GUIDE.md)。
+
+
+---
+
+### 56. 现货-期货资金费套利滑点量纲虚胖、反向倒挂开仓与风控回本模型深度复盘与迭代 (Case 56)
+- **事故背景与现象透视**：
+  - **运行实例**：`spot-perp-cash-carry-dryrun-neo-20261023-001`（策略文件：`v2_spot_perp_cash_carry.py`，标的池：Binance 现货 vs Hyperliquid 永续合约）。
+  - **严重异常暴露**：
+    1. **对账表惊现巨额幽灵亏损**：平仓记录中低价代币 REZ 单笔报亏 **-$129.05 USD**（单腿名义本金仅 $500，ROE 惨跌至 -19.36%），并瞬间触发单笔亏损风控熔断，导致 REZ 被系统强制拉黑隔离 24 小时（Quarantine）；
+    2. **移动保底反向割肉**：代币 TIA 在持有数小时、已稳定收取 14 次资金费后，突然被“保底止损”平仓，净亏损 -$1.70 USD，平仓原因赫然记录为：`Breakeven Trailing Stop Exit (ROE -0.25% < +0.20%)`；
+    3. **策略开仓即陷入逆势深渊**：多笔持仓在开仓后立即显示基差负数（Backwardation），盘面浮亏严重，资金费现金流无法弥补开仓摩擦成本。
+
+- **根因深度追溯（Six Deadly Sins）**：
+  1. **滑点量纲虚胖灾难（The Slippage Dimension Inflation & Phantom Loss - 核心罪魁）**：
+     - **代码漏洞**：在策略平仓计算函数中，滑点金额计算为：
+       `total_slippage = (p_spot_slip or 0) * coin_amt + (p_perp_slip or 0) * coin_amt`
+     - **量纲混淆**：`p_spot_slip` 为无量纲的相对价格滑点比例（如 `0.0005` 即 5 bps），而 `coin_amt` 为基础代币绝对枚数！
+     - **恶果爆发**：对于低价代币 REZ（单价 $0.004038），$500 名义货值对应代币数量高达 **123,814 个**！代码将 `0.0005 * 123814` 错误算成单边滑点 **$61.90 USD**，双边滑点高达 **$123.81 USD**！
+     - **真实财务数据**：真实双边滑点应为 `0.0005 * $500 * 2 = $0.50 USD`。滑点被按 `1 / 单价 = 250 倍` 严重夸大！一笔原本仅小幅亏损 -$3.43（真实 ROE -0.51%）的持仓被虚构成 -$129.05 巨亏，并误触风控隔离！
+  2. **滑点双重重复扣除死循环（Double-Deduction of Execution Slippage）**：
+     - 策略在模拟撮合中，成交价 `p_spot_exec` 与 `p_perp_exec` 本身就是通过穿透订单簿 Top 25 档挂单深度计算出的 VWAP 真实加权均价，并已内嵌了网络跳价时延滑点；
+     - 随后计算净损益时，又执行了 `net_trading_pnl = trading_pnl - total_friction`（其中 total_friction 包含了上述虚胖滑点），造成摩擦滑点在成交价和扣减项中被双重扣除。
+  3. **反向贴水开仓与回本防线失守（Backwardation Entry & Payback Barrier Violation）**：
+     - 历史提交放宽了开仓闸门，将回本时间由 12 小时放宽至 72 小时，并引入了“14天远期资金费补贴（`friction_to_yield_ratio <= 0.30`）”的宽松后门；
+     - 导致策略在合约价格低于现货价格（`basis_spread = -8 bps ~ -20 bps`，即 Backwardation 贴水）时开仓。在现货做多、合约做空的资金费套利模式下，贴水开仓意味着一入场就产生基差亏损，违背了资金费套利的稳健原则。
+  4. **移动保底反向割肉漏洞（Breakeven Trailing Stop at Negative ROE - TIA 案）**：
+     - TIA 浮盈一度达到 +0.8% 触发保底激活位；随后随微观基差小幅震荡，扣除手续费后 ROE 暂时回踩至 -0.25%；
+     - 代码仅判断 `roe_pct < breakeven_trailing_stop_pct`（+0.20%），未校验 `roe_pct >= 0.0`，导致在负 ROE 状态下将本该耐心持有赚取离散资金费的稳妥持仓提前斩仓割肉。
+  5. **并发开仓限额失效与瞬时打满**：
+     - 并发槽位可用余额仅在代币循环前读取一次，未在候选标的激活循环内部自增。当 6 个代币在同一个秒级 Tick 同时满足入场条件时，全部瞬间并发开仓，突破 `max_concurrent_tokens: 3` 限额。
+  6. **Hyperliquid Connector 抛出未捕获 `KeyError` 导致策略主循环崩溃**：
+     - `conn_perp.get_funding_info(tp_perp)` 在交易对未就绪时抛出 `KeyError: 'SAGA-USD'`，造成策略 Tick 异常中断退出；且原代码对畸变资金费（`abs(rate) > 0.5`）采用 `rate = 0.0001` 的任意假数据回填，埋下安全隐患。
+
+- **系统性重构与加固方案（Engineering Hardening Matrix）**：
+  1. **滑点量纲校准与单次扣费规范**：
+     - 滑点计算修正为：`spot_slippage = p_spot_slip * spot_notional_close`，严格以 Quote USD 计量；
+     - 明确净交易损益 `net_trading_pnl = trading_pnl - total_fees`，消除滑点双重扣除。
+  2. **绝对复归 AGENTS.md 核心风控红线（回本硬拦截）**：
+     - **严禁贴水开仓**：新增硬性条件 `if basis_spread < Decimal("-0.0003"): return basis_spread, total_friction, Decimal("999.0"), False`，基差贴水超过 3 bps 坚决不开仓；
+     - **回本周期硬拦截**：恢复 `max_payback_hours <= 12.0` 小时，彻底废除 14 天远期资金费后门。
+  3. **移动保底零下防护**：
+     - 增加 `roe_pct >= Decimal("0.0")` 硬性下界，绝不允许在负 ROE 下执行“保底”平仓。
+  4. **并发开仓槽位局部原子控制**：
+     - 在开仓候选遍历循环中引入 `allocated_slots`，每开一仓即刻自增，严格遵守并发限额。
+  5. **安全 Funding 查询引擎与数据清洗**：
+     - 实现 `get_safe_funding_info` 与 `get_safe_funding_rate_1h`，捕获所有 `KeyError`；资金费异常（`abs(rate) > 0.05`）一律归零处理。
+  6. **历史幽灵账本平反与对账**：
+     - 对 `spot_perp_cash_carry_trades.json` 进行对账平反：REZ 摩擦损耗由 $127.46 纠正为真实值 $1.85，净收益纠正为 -$3.43（真实 ROE -0.51%），解除 REZ 误隔离状态。
+  7. **自动化回归测试套件沉淀**：
+     - 在 `test/test_spot_perp_cash_carry.py` 中新增 `TestSpotPerpBugRegressions` 测试集，覆盖滑点量纲缩放、贴水拦截、KeyError 兜底与负 ROE 保底防护，9 大用例全部通过。

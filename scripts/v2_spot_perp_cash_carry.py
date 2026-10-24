@@ -7,7 +7,7 @@ import os
 import time
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from pydantic import Field, field_validator
 
@@ -91,23 +91,23 @@ class SpotPerpCashCarryConfig(StrategyV2ConfigBase):
 
     # --- Realistic Payback Horizon & Friction Allocation ---
     max_payback_hours: Decimal = Field(
-        default=Decimal("72.0"),
+        default=Decimal("12.0"),
         json_schema_extra={
-            "prompt": lambda mi: "Max hours of funding to recover roundtrip friction (e.g. 72.0): ",
+            "prompt": lambda mi: "Max hours of funding to recover roundtrip friction (e.g. 12.0): ",
             "prompt_on_new": True,
         }
     )
     target_horizon_hours: Decimal = Field(
-        default=Decimal("336.0"),
+        default=Decimal("168.0"),
         json_schema_extra={
-            "prompt": lambda mi: "Target holding horizon in hours for cash & carry yield allocation (e.g. 336.0 for 14d): ",
+            "prompt": lambda mi: "Target holding horizon in hours for cash & carry yield allocation (e.g. 168.0 for 7d): ",
             "prompt_on_new": False,
         }
     )
     max_friction_to_yield_ratio: Decimal = Field(
-        default=Decimal("0.30"),
+        default=Decimal("0.15"),
         json_schema_extra={
-            "prompt": lambda mi: "Max allowable ratio of entry friction over expected horizon yield (e.g. 0.30 for 30%): ",
+            "prompt": lambda mi: "Max allowable ratio of entry friction over expected horizon yield (e.g. 0.15 for 15%): ",
             "prompt_on_new": False,
         }
     )
@@ -350,6 +350,30 @@ class SpotPerpCashCarryStrategy(StrategyV2Base):
             return f"{token}-USD"
         return f"{token}-USDT"
 
+    def get_safe_funding_info(self, connector_name: str, trading_pair: str) -> Optional[Any]:
+        """Safely fetch funding info without raising unhandled KeyError on unready pairs."""
+        conn = self.connectors.get(connector_name)
+        if not conn:
+            return None
+        try:
+            return conn.get_funding_info(trading_pair)
+        except Exception:
+            return None
+
+    def get_safe_funding_rate_1h(self, connector_name: str, trading_pair: str) -> Decimal:
+        """Safely extract 1-hour funding rate. Returns 0 if missing or corrupt."""
+        f_info = self.get_safe_funding_info(connector_name, trading_pair)
+        if not f_info or getattr(f_info, "rate", None) is None:
+            return Decimal("0")
+        try:
+            rate = Decimal(str(f_info.rate))
+            # Sanity guard: an hourly rate above 5% (abs > 0.05) is anomalous corrupt data
+            if abs(rate) > Decimal("0.05"):
+                return Decimal("0")
+            return rate
+        except Exception:
+            return Decimal("0")
+
     # =========================================================================
     # Multi-Tier Asset Classification & Risk Controls
     # =========================================================================
@@ -418,13 +442,19 @@ class SpotPerpCashCarryStrategy(StrategyV2Base):
         - basis_spread: (p_perp - p_spot) / p_spot
         - total_friction: spot fees + perp fees + latency + slippage
         - payback_hours: hours of funding to recover friction
-        - is_acceptable: True if meets either payback_hours <= max_payback_hours OR friction-to-yield ratio <= max_friction_to_yield_ratio
+        - is_acceptable: True if meets either payback_hours <= max_payback_hours
         """
         basis_spread = (p_perp_exec - p_spot_exec) / p_spot_exec
         roundtrip_fees = (self.config.spot_taker_fee_rate * Decimal("2.0")) + (self.config.perp_taker_fee_rate * Decimal("2.0"))
         roundtrip_latency = self.config.simulated_latency_slippage_pct * Decimal("4.0")
         est_slippage = (p_spot_slip or Decimal("0")) + (p_perp_slip or Decimal("0"))
         total_friction = roundtrip_fees + roundtrip_latency + (est_slippage * Decimal("2.0"))
+
+        # Cash & Carry Risk Red Line (Rule 4 in AGENTS.md):
+        # Ban entering in Backwardation (Perp < Spot).
+        # We must never start in a deficit hole larger than 3 bps.
+        if basis_spread < Decimal("-0.0003"):
+            return basis_spread, total_friction, Decimal("999.0"), False
 
         # Net hurdle: If Perp > Spot (Contango), basis surplus directly offsets friction!
         net_hurdle = total_friction - basis_spread
@@ -435,9 +465,7 @@ class SpotPerpCashCarryStrategy(StrategyV2Base):
             is_acceptable = True
         elif rate_1h > Decimal("0"):
             payback_hours = net_hurdle / rate_1h
-            expected_funding = rate_1h * self.config.target_horizon_hours
-            friction_ratio = net_hurdle / expected_funding if expected_funding > Decimal("0") else Decimal("999.0")
-            is_acceptable = (payback_hours <= self.config.max_payback_hours) or (friction_ratio <= self.config.max_friction_to_yield_ratio)
+            is_acceptable = payback_hours <= self.config.max_payback_hours
         else:
             payback_hours = Decimal("999.0")
             is_acceptable = False
@@ -465,11 +493,7 @@ class SpotPerpCashCarryStrategy(StrategyV2Base):
             if now >= next_f and next_f > 0:
                 perp_conn_name = pos["perp_connector"]
                 tp = self.get_trading_pair_for_connector(token, perp_conn_name)
-                f_info = self.connectors[perp_conn_name].get_funding_info(tp)
-
-                raw_rate = Decimal(str(f_info.rate)) if f_info else Decimal("0")
-                if abs(raw_rate) > Decimal("0.5"):
-                    raw_rate = Decimal("0.0001")
+                raw_rate = self.get_safe_funding_rate_1h(perp_conn_name, tp)
 
                 notional = Decimal(str(pos["position_size"]))
                 # Short receives when rate > 0
@@ -518,8 +542,10 @@ class SpotPerpCashCarryStrategy(StrategyV2Base):
         if available_slots <= 0:
             return []
 
+        allocated_slots = len(self.active_positions)
+
         for token in self.config.tokens:
-            if len(self.active_positions) >= self.config.max_concurrent_tokens:
+            if allocated_slots >= self.config.max_concurrent_tokens:
                 break
             if token in self.active_positions:
                 continue
@@ -538,13 +564,10 @@ class SpotPerpCashCarryStrategy(StrategyV2Base):
                 continue
 
             # 2. Query Hyperliquid Perpetual funding info & calculate annualized APR
-            f_info = conn_perp.get_funding_info(tp_perp)
-            if not f_info:
+            rate_1h = self.get_safe_funding_rate_1h(c_perp, tp_perp)
+            if rate_1h <= Decimal("0"):
+                self.entry_candidate_ticks[token] = 0
                 continue
-
-            rate_1h = Decimal(str(f_info.rate))
-            if abs(rate_1h) > Decimal("0.5"):
-                rate_1h = Decimal("0.0001")
 
             daily_rate = rate_1h * Decimal("24")
             annual_apr = daily_rate * Decimal("365")
@@ -644,6 +667,7 @@ class SpotPerpCashCarryStrategy(StrategyV2Base):
             }
 
             self.active_positions[token] = pos_data
+            allocated_slots += 1
             self.entry_candidate_ticks[token] = 0
             self.logger().info(
                 f"🚀 [SPOT-PERP-ENTRY-TRIGGER] Token '{token}' (Tier {pos_data['tier']}) Cash & Carry Activated!\n"
@@ -690,10 +714,7 @@ class SpotPerpCashCarryStrategy(StrategyV2Base):
                 continue
 
             # Query live funding APR
-            f_info = conn_perp.get_funding_info(tp_perp) if conn_perp else None
-            rate_1h = Decimal(str(f_info.rate)) if f_info else Decimal("0")
-            if abs(rate_1h) > Decimal("0.5"):
-                rate_1h = Decimal("0.0001")
+            rate_1h = self.get_safe_funding_rate_1h(c_perp, tp_perp)
             curr_apr = rate_1h * Decimal("24") * Decimal("365")
 
             # Financial PnL attribution
@@ -713,10 +734,16 @@ class SpotPerpCashCarryStrategy(StrategyV2Base):
             spot_fee = (spot_notional_open + spot_notional_close) * self.config.spot_taker_fee_rate
             perp_fee = (perp_notional_open + perp_notional_close) * self.config.perp_taker_fee_rate
             total_fees = spot_fee + perp_fee
-            total_slippage = (p_spot_slip or Decimal("0")) * coin_amt + (p_perp_slip or Decimal("0")) * coin_amt
+
+            # Slippage in quote currency USD (ratio * quote notional close)
+            spot_slippage = (p_spot_slip or Decimal("0")) * spot_notional_close
+            perp_slippage = (p_perp_slip or Decimal("0")) * perp_notional_close
+            total_slippage = spot_slippage + perp_slippage
             total_friction = total_fees + total_slippage
 
-            net_trading_pnl = trading_pnl - total_friction
+            # Execution VWAP prices (p_spot_exec, p_perp_exec) ALREADY embed execution depth and latency slippage.
+            # To avoid double-counting slippage, net trading PnL is gross trading PnL minus transaction fees:
+            net_trading_pnl = trading_pnl - total_fees
             settled_funding = Decimal(str(pos.get("settled_funding_pnl", 0.0)))
             total_net_pnl = net_trading_pnl + settled_funding
 
@@ -758,9 +785,10 @@ class SpotPerpCashCarryStrategy(StrategyV2Base):
                 part_spot_pnl = (p_spot_exec - p_spot_entry) * closed_coin_amt
                 part_perp_pnl = (p_perp_entry - p_perp_exec) * closed_coin_amt
                 part_trading_pnl = part_spot_pnl + part_perp_pnl
+                part_fees = total_fees * ratio
                 part_friction = total_friction * ratio
                 part_settled_funding = settled_funding * ratio
-                part_net_pnl = part_trading_pnl - part_friction + part_settled_funding
+                part_net_pnl = part_trading_pnl - part_fees + part_settled_funding
                 part_capital = total_capital * ratio
 
                 self.logger().info(
@@ -791,7 +819,7 @@ class SpotPerpCashCarryStrategy(StrategyV2Base):
                     "perp_pnl": float(part_perp_pnl),
                     "trading_pnl": float(part_trading_pnl),
                     "total_friction_cost": float(part_friction),
-                    "net_trading_pnl": float(part_trading_pnl - part_friction),
+                    "net_trading_pnl": float(part_trading_pnl - part_fees),
                     "settled_funding_pnl": float(part_settled_funding),
                     "funding_payments": pos.get("funding_payments", []),
                     "settlement_count": len(pos.get("funding_payments", [])),
@@ -827,9 +855,11 @@ class SpotPerpCashCarryStrategy(StrategyV2Base):
             is_liq_danger = safety_cushion_pct <= tier_liq_buf
 
             # 4. Breakeven Trailing Stop Loss
+            # Ensure it acts as a true breakeven floor and does not stop out at a negative ROE
             is_breakeven_stop = (
                 pos.get("breakeven_active", False) and
                 roe_pct < self.config.breakeven_trailing_stop_pct and
+                roe_pct >= Decimal("0.0") and
                 duration_s >= self.config.min_holding_seconds
             )
 
@@ -962,10 +992,7 @@ class SpotPerpCashCarryStrategy(StrategyV2Base):
             tp_perp = self.get_trading_pair_for_connector(tok, c_perp)
 
             try:
-                f_info = conn_perp.get_funding_info(tp_perp)
-                rate_1h = Decimal(str(f_info.rate)) if f_info else Decimal("0")
-                if abs(rate_1h) > Decimal("0.5"):
-                    rate_1h = Decimal("0.0001")
+                rate_1h = self.get_safe_funding_rate_1h(c_perp, tp_perp)
                 annual_apr = rate_1h * Decimal("24") * Decimal("365")
 
                 p_spot = self.get_price_from_orderbook(c_spot, tp_spot, is_buy=True)
