@@ -156,6 +156,63 @@ class BasisStatArbitrageConfig(StrategyV2ConfigBase):
             "prompt_on_new": False
         }
     )
+    # --- Optimization 3 (Option 1): Exhaustion Peak & Right-Side Sniper Mechanism (Case 52) ---
+    sniper_mode_enabled: bool = Field(
+        default=True,
+        json_schema_extra={
+            "prompt": lambda mi: "Enable Exhaustion Peak & Right-Side Sniper for extreme basis dislocations? (True/False): ",
+            "prompt_on_new": False,
+        }
+    )
+    sniper_trigger_basis_pct: Decimal = Field(
+        default=Decimal("0.0150"),
+        json_schema_extra={
+            "prompt": lambda mi: "Dislocation threshold to begin tracking extreme basis prey (e.g. 0.0150 for 1.50%): ",
+            "prompt_on_new": False,
+        }
+    )
+    sniper_reversal_confirmation_pct: Decimal = Field(
+        default=Decimal("0.0020"),
+        json_schema_extra={
+            "prompt": lambda mi: "Basis contraction required from peak to confirm right-side exhaustion (e.g. 0.0020 for 20 bps): ",
+            "prompt_on_new": False,
+        }
+    )
+    sniper_confirmation_ticks: int = Field(
+        default=3,
+        json_schema_extra={
+            "prompt": lambda mi: "Consecutive ticks contraction must persist to confirm exhaustion peak (e.g. 3): ",
+            "prompt_on_new": False,
+        }
+    )
+    sniper_position_size_quote: Decimal = Field(
+        default=Decimal("300.0"),
+        json_schema_extra={
+            "prompt": lambda mi: "Position size quote per leg for sniper orders (e.g. 300.0 USD): ",
+            "prompt_on_new": False,
+        }
+    )
+    sniper_take_profit_basis_pct: Decimal = Field(
+        default=Decimal("0.0035"),
+        json_schema_extra={
+            "prompt": lambda mi: "Target basis compression for sniper take-profit (e.g. 0.0035 for 0.35%): ",
+            "prompt_on_new": False,
+        }
+    )
+    sniper_stop_loss_distance_pct: Decimal = Field(
+        default=Decimal("0.0030"),
+        json_schema_extra={
+            "prompt": lambda mi: "Emergency invalidation stop if basis expands above peak by (e.g. 0.0030 for 30 bps): ",
+            "prompt_on_new": False,
+        }
+    )
+    sniper_max_prey_dwell_seconds: int = Field(
+        default=3600,
+        json_schema_extra={
+            "prompt": lambda mi: "Max seconds to track extreme prey before timeout (e.g. 3600 for 1 hour): ",
+            "prompt_on_new": False,
+        }
+    )
     require_favorable_funding: bool = Field(
         default=False,
         json_schema_extra={
@@ -496,6 +553,7 @@ class BasisStatArbitrage(StrategyV2Base):
         self.divergence_tick_counter: Dict[str, int] = {}
         self.token_last_closed_timestamp: Dict[str, float] = {}
         self.quarantine_tokens: Dict[str, float] = {}
+        self.sniper_prey_tracker: Dict[str, Dict] = {}
 
         # Two-Tier Dynamic Universe Rotation & Hot-Swap Engine
         self.market_discovery_candidates: List[Dict] = []
@@ -597,6 +655,16 @@ class BasisStatArbitrage(StrategyV2Base):
                         if float(q_ts) > now_ts:
                             self.quarantine_tokens[q_tok] = float(q_ts)
 
+                    # Restore sniper prey tracker if present and unexpired
+                    persisted_prey = data.get("sniper_prey_tracker", {})
+                    dwell_limit = int(getattr(self.config, "sniper_max_prey_dwell_seconds", 3600))
+                    for p_tok, p_data in persisted_prey.items():
+                        p_init = float(p_data.get("initial_trigger_ts", 0.0))
+                        if now_ts - p_init < dwell_limit:
+                            self.sniper_prey_tracker[p_tok] = p_data
+                    if self.sniper_prey_tracker:
+                        self.logger().info(f"[BASIS-STAT-ARB] Restored {len(self.sniper_prey_tracker)} active sniper prey(s) from {path}")
+
                     # Restore dynamically adapted universe tokens if present
                     persisted_universe = data.get("active_universe_tokens")
                     if persisted_universe and isinstance(persisted_universe, (list, set)) and len(persisted_universe) >= 10:
@@ -617,6 +685,7 @@ class BasisStatArbitrage(StrategyV2Base):
             self.check_strategy_commands()
             self.check_funding_settlement()
             self.check_universe_rotation()
+            self.update_sniper_prey_tracking()
             actions = self.determine_executor_actions()
             for action in actions:
                 self.executor_orchestrator.execute_action(action)
@@ -1182,6 +1251,80 @@ class BasisStatArbitrage(StrategyV2Base):
         )
         return False, Decimal("0"), "INSUFFICIENT_MARGIN"
 
+    def update_sniper_prey_tracking(self):
+        """
+        🎯 Option 1: Right-Side Exhaustion Peak Tracker (Case 52)
+        Continuously monitors extreme basis prey, updates their peak basis dislocation,
+        and counts consecutive contraction ticks once basis begins to mean-revert from peak.
+        """
+        if not getattr(self.config, "sniper_mode_enabled", True) or not self.sniper_prey_tracker:
+            return
+
+        if len(self.config.connectors) < 2:
+            return
+
+        c1, c2 = list(self.config.connectors)[:2]
+        now = self.current_timestamp
+        dwell_limit = int(getattr(self.config, "sniper_max_prey_dwell_seconds", 3600))
+        reversal_min_pct = float(getattr(self.config, "sniper_reversal_confirmation_pct", Decimal("0.0020")))
+        req_ticks = int(getattr(self.config, "sniper_confirmation_ticks", 3))
+
+        for token, prey in list(self.sniper_prey_tracker.items()):
+            # 1. If token already has an active position, remove from tracker
+            if token in self.active_basis_arbitrages:
+                del self.sniper_prey_tracker[token]
+                continue
+
+            # 2. Check dwell time expiry
+            init_ts = float(prey.get("initial_trigger_ts", now))
+            if now - init_ts > dwell_limit:
+                self.logger().info(f"🎯 [SNIPER-PREY-EXPIRED] Tracking for '{token}' expired after {int(now - init_ts)}s.")
+                del self.sniper_prey_tracker[token]
+                continue
+
+            tp1 = self.get_trading_pair_for_connector(token, c1)
+            tp2 = self.get_trading_pair_for_connector(token, c2)
+            m1 = Decimal(str(self.get_token_multiplier(token, c1)))
+            m2 = Decimal(str(self.get_token_multiplier(token, c2)))
+
+            p1_ind = self.get_indicative_price(c1, tp1)
+            p2_ind = self.get_indicative_price(c2, tp2)
+            if p1_ind is None or p2_ind is None or p1_ind <= 0 or p2_ind <= 0:
+                continue
+
+            p1_norm = p1_ind / m1
+            p2_norm = p2_ind / m2
+            spread_ind = abs(p1_norm - p2_norm) / min(p1_norm, p2_norm)
+            curr_abs_basis = float(spread_ind)
+            prey["last_basis"] = curr_abs_basis
+
+            peak_basis = float(prey.get("peak_basis", curr_abs_basis))
+
+            # 3. Peak expansion check
+            if curr_abs_basis > peak_basis:
+                prey["peak_basis"] = curr_abs_basis
+                prey["peak_ts"] = now
+                prey["consecutive_contraction_ticks"] = 0
+                prey["status"] = "TRACKING_PEAK"
+                self.logger().info(
+                    f"🎯 [SNIPER-PEAK-EXPANDED] Prey '{token}' pushed new peak basis: {curr_abs_basis:+.2%} "
+                    f"(Source: {prey.get('source', 'UNKNOWN')})"
+                )
+            else:
+                # 4. Contraction check from peak
+                contraction = peak_basis - curr_abs_basis
+                if contraction >= reversal_min_pct:
+                    ticks = prey.get("consecutive_contraction_ticks", 0) + 1
+                    prey["consecutive_contraction_ticks"] = ticks
+                    prey["status"] = "CONFIRMING_REVERSAL"
+                    self.logger().info(
+                        f"🎯 [SNIPER-REVERSAL-CONFIRMING] Prey '{token}' contracted {contraction*10000:.1f} bps from peak {peak_basis:.2%} "
+                        f"(Current: {curr_abs_basis:.2%}, Ticks: {ticks}/{req_ticks})"
+                    )
+                else:
+                    prey["consecutive_contraction_ticks"] = 0
+                    prey["status"] = "TRACKING_PEAK"
+
     def create_actions_proposal(self) -> List[CreateExecutorAction]:
         """
         Evaluate if cross-exchange basis dislocation has opened up on any configured token.
@@ -1191,6 +1334,175 @@ class BasisStatArbitrage(StrategyV2Base):
             return create_actions
 
         c1, c2 = list(self.config.connectors)[:2]
+
+        # ----------------- Option 1: Right-Side Sniper Counter-Attack Execution (Case 52) -----------------
+        if getattr(self.config, "sniper_mode_enabled", True) and self.sniper_prey_tracker:
+            req_ticks = int(getattr(self.config, "sniper_confirmation_ticks", 3))
+            sniper_sz = Decimal(str(getattr(self.config, "sniper_position_size_quote", Decimal("300.0"))))
+
+            for s_tok, prey in list(self.sniper_prey_tracker.items()):
+                if s_tok in self.active_basis_arbitrages:
+                    del self.sniper_prey_tracker[s_tok]
+                    continue
+
+                if prey.get("status") == "CONFIRMING_REVERSAL" and prey.get("consecutive_contraction_ticks", 0) >= req_ticks:
+                    tp1 = self.get_trading_pair_for_connector(s_tok, c1)
+                    tp2 = self.get_trading_pair_for_connector(s_tok, c2)
+                    m1 = Decimal(str(self.get_token_multiplier(s_tok, c1)))
+                    m2 = Decimal(str(self.get_token_multiplier(s_tok, c2)))
+
+                    p1_b_best, p1_b_vwap, p1_b_exec, p1_b_slip = self.get_orderbook_execution_metrics(c1, tp1, is_buy=False, quote_volume=sniper_sz)
+                    p2_a_best, p2_a_vwap, p2_a_exec, p2_a_slip = self.get_orderbook_execution_metrics(c2, tp2, is_buy=True, quote_volume=sniper_sz)
+                    spread_A = Decimal("-999")
+                    if p1_b_exec is not None and p2_a_exec is not None:
+                        p1_b_norm = p1_b_exec / m1
+                        p2_a_norm = p2_a_exec / m2
+                        spread_A = (p1_b_norm - p2_a_norm) / p2_a_norm
+
+                    p1_a_best, p1_a_vwap, p1_a_exec, p1_a_slip = self.get_orderbook_execution_metrics(c1, tp1, is_buy=True, quote_volume=sniper_sz)
+                    p2_b_best, p2_b_vwap, p2_b_exec, p2_b_slip = self.get_orderbook_execution_metrics(c2, tp2, is_buy=False, quote_volume=sniper_sz)
+                    spread_B = Decimal("-999")
+                    if p1_a_exec is not None and p2_b_exec is not None:
+                        p1_a_norm = p1_a_exec / m1
+                        p2_b_norm = p2_b_exec / m2
+                        spread_B = (p2_b_norm - p1_a_norm) / p1_a_norm
+
+                    if spread_A > Decimal("0") and spread_A >= spread_B:
+                        s_c1_side = TradeType.SELL
+                        s_c2_side = TradeType.BUY
+                        s_c1_best, s_c1_vwap, s_c1_exec, s_c1_slip = p1_b_best, p1_b_vwap, p1_b_exec, p1_b_slip or Decimal("0")
+                        s_c2_best, s_c2_vwap, s_c2_exec, s_c2_slip = p2_a_best, p2_a_vwap, p2_a_exec, p2_a_slip or Decimal("0")
+                        s_c1_norm, s_c2_norm = p1_b_norm, p2_a_norm
+                        s_spread = spread_A
+                    elif spread_B > Decimal("0") and spread_B > spread_A:
+                        s_c1_side = TradeType.BUY
+                        s_c2_side = TradeType.SELL
+                        s_c1_best, s_c1_vwap, s_c1_exec, s_c1_slip = p1_a_best, p1_a_vwap, p1_a_exec, p1_a_slip or Decimal("0")
+                        s_c2_best, s_c2_vwap, s_c2_exec, s_c2_slip = p2_b_best, p2_b_vwap, p2_b_exec, p2_b_slip or Decimal("0")
+                        s_c1_norm, s_c2_norm = p1_a_norm, p2_b_norm
+                        s_spread = spread_B
+                    else:
+                        continue
+
+                    # Margin check for sniper order
+                    margin_pass, final_sz, margin_reason = self._check_dual_exchange_margin_sufficiency(
+                        token=s_tok, c1=c1, tp1=tp1, c1_exec_price=s_c1_exec,
+                        c2=c2, tp2=tp2, c2_exec_price=s_c2_exec, pos_size=sniper_sz
+                    )
+                    if not margin_pass:
+                        self.logger().warning(f"🎯 [SNIPER-MARGIN-FAIL] Sniper opportunity on '{s_tok}' blocked: {margin_reason}")
+                        continue
+
+                    max_exec_p = max(s_c1_exec, s_c2_exec)
+                    hedged_amt = sniper_sz / max_exec_p if max_exec_p > 0 else Decimal("0")
+                    notional_1 = hedged_amt * s_c1_exec
+                    notional_2 = hedged_amt * s_c2_exec
+                    tot_notional = notional_1 + notional_2
+                    lev_val = Decimal(str(self.config.leverage))
+                    margin_1 = notional_1 / lev_val if lev_val > 0 else notional_1
+                    margin_2 = notional_2 / lev_val if lev_val > 0 else notional_2
+                    tot_margin = margin_1 + margin_2
+
+                    if s_c1_side == TradeType.BUY:
+                        entry_depth_slip_cost_1 = (s_c1_vwap - s_c1_best) * hedged_amt
+                        entry_latency_slip_cost_1 = (s_c1_exec - s_c1_vwap) * hedged_amt
+                    else:
+                        entry_depth_slip_cost_1 = (s_c1_best - s_c1_vwap) * hedged_amt
+                        entry_latency_slip_cost_1 = (s_c1_vwap - s_c1_exec) * hedged_amt
+
+                    if s_c2_side == TradeType.BUY:
+                        entry_depth_slip_cost_2 = (s_c2_vwap - s_c2_best) * hedged_amt
+                        entry_latency_slip_cost_2 = (s_c2_exec - s_c2_vwap) * hedged_amt
+                    else:
+                        entry_depth_slip_cost_2 = (s_c2_best - s_c2_vwap) * hedged_amt
+                        entry_latency_slip_cost_2 = (s_c2_vwap - s_c2_exec) * hedged_amt
+
+                    peak_b = float(prey.get("peak_basis", float(s_spread)))
+                    stop_b = peak_b + float(getattr(self.config, "sniper_stop_loss_distance_pct", Decimal("0.0030")))
+
+                    self.logger().info(
+                        f"🎯 [SNIPER-LAUNCH-TRIGGERED] Token '{s_tok}' Right-Side Exhaustion Confirmed!\n"
+                        f"  Peak Basis: {peak_b:+.2%} -> Entry Basis: {float(s_spread):+.2%} (Contraction: {(peak_b - float(s_spread))*10000:.1f} bps)\n"
+                        f"  Coin-Neutral Size: {float(hedged_amt):,.4f} {s_tok} (${float(sniper_sz):,.2f} quote per leg)\n"
+                        f"  Leg 1 ({c1}): {s_c1_side.name} @ ${float(s_c1_exec):.4f} | Leg 2 ({c2}): {s_c2_side.name} @ ${float(s_c2_exec):.4f}\n"
+                        f"  Invalidation Defense Line: {stop_b:+.2%} (+{float(getattr(self.config, 'sniper_stop_loss_distance_pct', Decimal('0.0030')))*10000:.0f} bps past peak)"
+                    )
+
+                    pos_data = {
+                        "token": s_tok,
+                        "is_virtual": self.config.dry_run,
+                        "connector_1": c1,
+                        "connector_2": c2,
+                        "side_1": s_c1_side.name,
+                        "side_2": s_c2_side.name,
+                        "amount_1": float(hedged_amt),
+                        "amount_2": float(hedged_amt),
+                        "entry_best_price_1": float(s_c1_best),
+                        "entry_best_price_2": float(s_c2_best),
+                        "entry_vwap_1": float(s_c1_vwap),
+                        "entry_vwap_2": float(s_c2_vwap),
+                        "entry_price_1": float(s_c1_exec),
+                        "entry_price_2": float(s_c2_exec),
+                        "entry_depth_slip_cost_1": float(entry_depth_slip_cost_1),
+                        "entry_depth_slip_cost_2": float(entry_depth_slip_cost_2),
+                        "entry_latency_slip_cost_1": float(entry_latency_slip_cost_1),
+                        "entry_latency_slip_cost_2": float(entry_latency_slip_cost_2),
+                        "entry_norm_price_1": float(s_c1_norm),
+                        "entry_norm_price_2": float(s_c2_norm),
+                        "entry_basis_pct": float(s_spread),
+                        "target_compression_pct": float(getattr(self.config, "sniper_take_profit_basis_pct", Decimal("0.0035"))),
+                        "position_size": float(sniper_sz),
+                        "safe_capacity": float(sniper_sz),
+                        "top3_depth_1": 0.0,
+                        "top3_depth_2": 0.0,
+                        "net_executable_edge_pct": float(s_spread),
+                        "entry_depth_slip_pct_1": float(s_c1_slip),
+                        "entry_depth_slip_pct_2": float(s_c2_slip),
+                        "single_notional": float(sniper_sz),
+                        "total_notional": float(tot_notional),
+                        "leverage": self.config.leverage,
+                        "margin_1": float(margin_1),
+                        "margin_2": float(margin_2),
+                        "total_margin": float(tot_margin),
+                        "open_timestamp": self.current_timestamp,
+                        "expected_daily_carry": 0.0,
+                        "trailing_active": False,
+                        "peak_pnl_pct": 0.0,
+                        "settled_funding_pnl": 0.0,
+                        "funding_payments": [],
+                        "next_funding_time_1": int(self.current_timestamp + 28800),
+                        "next_funding_time_2": int(self.current_timestamp + 3600),
+                        "min_holding_seconds": 5,
+                        # Sniper specific flags
+                        "is_sniper": True,
+                        "sniper_peak_basis": peak_b,
+                        "sniper_entry_basis": float(s_spread),
+                        "sniper_stop_basis": stop_b,
+                    }
+
+                    if s_tok in self.quarantine_tokens:
+                        del self.quarantine_tokens[s_tok]
+                    del self.sniper_prey_tracker[s_tok]
+
+                    if self.config.dry_run:
+                        self.active_basis_arbitrages[s_tok] = pos_data
+                    else:
+                        pos_cfg_1 = PositionExecutorConfig(
+                            timestamp=self.current_timestamp, connector_name=c1,
+                            trading_pair=tp1, side=s_c1_side, entry_price=s_c1_exec,
+                            amount=hedged_amt, leverage=self.config.leverage,
+                            triple_barrier_config=TripleBarrierConfig(open_order_type=OrderType.MARKET),
+                        )
+                        pos_cfg_2 = PositionExecutorConfig(
+                            timestamp=self.current_timestamp, connector_name=c2,
+                            trading_pair=tp2, side=s_c2_side, entry_price=s_c2_exec,
+                            amount=hedged_amt, leverage=self.config.leverage,
+                            triple_barrier_config=TripleBarrierConfig(open_order_type=OrderType.MARKET),
+                        )
+                        pos_data["is_virtual"] = False
+                        pos_data["executors_ids"] = [pos_cfg_1.id, pos_cfg_2.id]
+                        self.active_basis_arbitrages[s_tok] = pos_data
+                        create_actions.extend([CreateExecutorAction(executor_config=pos_cfg_1), CreateExecutorAction(executor_config=pos_cfg_2)])
 
         for token in self.config.tokens:
             if token in self.active_basis_arbitrages:
@@ -1272,6 +1584,32 @@ class BasisStatArbitrage(StrategyV2Base):
                     spread_B = (p2_bid_norm - p1_ask_norm) / p1_ask_norm
 
             min_entry = self.config.min_entry_basis_pct
+
+            # Freight-Train Defense & Extreme Dislocation Sniper Registration (Case 52)
+            # If basis dislocation is extreme (>= sniper_trigger_basis_pct e.g. 1.50%),
+            # NEVER open a regular position on the left side into a runaway whale squeeze!
+            # Instead, register token in sniper_prey_tracker to wait for right-side exhaustion.
+            sniper_trigger_thresh = getattr(self.config, "sniper_trigger_basis_pct", Decimal("0.0150"))
+            max_cand_spread = max(spread_A, spread_B)
+            if getattr(self.config, "sniper_mode_enabled", True) and max_cand_spread >= sniper_trigger_thresh:
+                if token not in self.sniper_prey_tracker:
+                    self.sniper_prey_tracker[token] = {
+                        "token": token,
+                        "source": "EXTREME_DISLOCATION_SCAN",
+                        "initial_trigger_ts": self.current_timestamp,
+                        "peak_basis": float(max_cand_spread),
+                        "peak_ts": self.current_timestamp,
+                        "consecutive_contraction_ticks": 0,
+                        "last_basis": float(max_cand_spread),
+                        "status": "TRACKING_PEAK",
+                    }
+                    self.logger().info(
+                        f"🛡️ [FREIGHT-TRAIN-DEFENSE] Token '{token}' basis ({float(max_cand_spread):+.2%}) "
+                        f"exceeds extreme threshold ({float(sniper_trigger_thresh):.2%}). "
+                        f"Standard entry skipped; registered as Sniper Prey for right-side exhaustion tracking!"
+                    )
+                self.entry_candidate_ticks[token] = 0
+                continue
 
             # Determine best executable direction
             if spread_A >= min_entry and spread_A >= spread_B:
@@ -1748,9 +2086,23 @@ class BasisStatArbitrage(StrategyV2Base):
             # Normal exits require exit eligibility:
             normal_exit_candidate = is_exit_eligible and (basis_tp_raw or net_tp_raw or trailing_stop_raw or is_early_tp_qualified)
 
+            # Option 1: Right-Side Sniper Exit Evaluation (Case 52)
+            is_sniper_pos = pos.get("is_sniper", False)
+            if is_sniper_pos:
+                sniper_tp_thresh = getattr(self.config, "sniper_take_profit_basis_pct", Decimal("0.0035"))
+                sniper_stop_basis = Decimal(str(pos.get("sniper_stop_basis", 0.0250)))
+                sniper_tp_raw = (abs(curr_basis) <= sniper_tp_thresh or net_pnl_pct >= self.config.min_take_profit_net_pct) and total_net_pnl > 0
+                sniper_sl_raw = (abs(curr_basis) >= sniper_stop_basis)
+                is_sniper_eligible = (duration_s >= 5)
+                sniper_exit_candidate = is_sniper_eligible and (sniper_tp_raw or sniper_sl_raw)
+            else:
+                sniper_tp_raw = False
+                sniper_sl_raw = False
+                sniper_exit_candidate = False
+
             # Exit persistence: require 2 consecutive ticks before closing
             req_exit_ticks = getattr(self.config, "exit_persistence_ticks", 2)
-            if normal_exit_candidate:
+            if normal_exit_candidate or sniper_exit_candidate:
                 self.exit_candidate_ticks[token] = self.exit_candidate_ticks.get(token, 0) + 1
             else:
                 self.exit_candidate_ticks[token] = 0
@@ -1761,6 +2113,8 @@ class BasisStatArbitrage(StrategyV2Base):
             basis_tp_condition = is_exit_confirmed and basis_tp_raw and is_exit_eligible
             net_tp_condition = is_exit_confirmed and net_tp_raw and is_exit_eligible
             trailing_stop_condition = is_exit_confirmed and trailing_stop_raw and is_exit_eligible
+            sniper_tp_condition = is_exit_confirmed and is_sniper_pos and sniper_tp_raw
+            sniper_sl_condition = is_exit_confirmed and is_sniper_pos and sniper_sl_raw
 
             # 4. Max Hold Timeout Expiry:
             max_h = float(self.config.max_hold_hours)
@@ -1779,8 +2133,12 @@ class BasisStatArbitrage(StrategyV2Base):
             stop_loss_condition = self.divergence_tick_counter.get(token, 0) >= req_divergence_ticks
 
             # Check if any condition triggered
-            if basis_tp_condition or net_tp_condition or trailing_stop_condition or timeout_condition or stop_loss_condition or early_tp_condition:
-                if stop_loss_condition:
+            if basis_tp_condition or net_tp_condition or trailing_stop_condition or timeout_condition or stop_loss_condition or early_tp_condition or sniper_tp_condition or sniper_sl_condition:
+                if sniper_sl_condition:
+                    reason = f"🛑 [SNIPER-INVALIDATION-STOP] Basis expanded past peak defense {float(pos.get('sniper_stop_basis', 0.0)):.2%} (Current: {float(curr_basis):+.2%})"
+                elif sniper_tp_condition:
+                    reason = f"🎯 [SNIPER-TAKE-PROFIT] Exhaustion Mean-Reversion Captured! (Peak: {float(pos.get('sniper_peak_basis', 0.0)):.2%} ➔ Current: {float(curr_basis):+.2%})"
+                elif stop_loss_condition:
                     reason = f"Emergency Basis Divergence Stop-Loss ({float(net_pnl_pct):.2%} <= -{float(max_loss_pct):.2%})"
                 elif early_tp_condition:
                     reason = f"Profit-Locked Early TP (+{float(net_pnl_pct):.2%} >= +{float(early_tp_threshold):.2%}, held {duration_s}s)"
@@ -1840,6 +2198,23 @@ class BasisStatArbitrage(StrategyV2Base):
                     f"🚨 [QUARANTINE-ACTIVATED] Token '{token}' quarantined for {quarantine_s // 60}m "
                     f"until {self.current_timestamp + quarantine_s} due to divergence stop-loss!"
                 )
+                # Option 1 (Case 52): Register in Sniper Prey Tracker for right-side counter-attack
+                if getattr(self.config, "sniper_mode_enabled", True) and not pos.get("is_sniper", False):
+                    peak_b = max(abs(float(item["close_basis_pct"])), abs(float(pos["entry_basis_pct"])))
+                    self.sniper_prey_tracker[token] = {
+                        "token": token,
+                        "source": "STOP_LOSS_REVERSAL",
+                        "initial_trigger_ts": self.current_timestamp,
+                        "peak_basis": peak_b,
+                        "peak_ts": self.current_timestamp,
+                        "consecutive_contraction_ticks": 0,
+                        "last_basis": abs(float(item["close_basis_pct"])),
+                        "status": "TRACKING_PEAK",
+                    }
+                    self.logger().info(
+                        f"🎯 [SNIPER-PREY-TARGETED] Token '{token}' registered for Sniper tracking after divergence stop! "
+                        f"Initial Peak Basis: {peak_b:+.2%}"
+                    )
 
             # Count unique settlement window timestamps
             unique_windows = len(set(p.get("timestamp") for p in pos.get("funding_payments", []) if p.get("timestamp")))
@@ -1916,6 +2291,10 @@ class BasisStatArbitrage(StrategyV2Base):
                 "net_roe_pct": item["net_roe_pct"],
                 "alpha_retention_pct": item["alpha_retention_pct"],
                 "close_reason": item["reason"],
+                "is_sniper": pos.get("is_sniper", False),
+                "sniper_peak_basis": pos.get("sniper_peak_basis", 0.0),
+                "sniper_entry_basis": pos.get("sniper_entry_basis", 0.0),
+                "sniper_stop_basis": pos.get("sniper_stop_basis", 0.0),
                 "open_timestamp": pos["open_timestamp"],
                 "close_timestamp": self.current_timestamp,
                 "duration_seconds": item["duration_seconds"],
@@ -2009,6 +2388,10 @@ class BasisStatArbitrage(StrategyV2Base):
             "token_admitted_at": getattr(self, "token_admitted_at", {}),
             "active_universe_tokens": list(self.config.tokens),
             "quarantined_tokens": {tok: ts for tok, ts in self.quarantine_tokens.items() if self.current_timestamp < ts},
+            "sniper_prey_tracker": {
+                tok: data for tok, data in self.sniper_prey_tracker.items()
+                if self.current_timestamp - float(data.get("initial_trigger_ts", 0.0)) < int(getattr(self.config, "sniper_max_prey_dwell_seconds", 3600))
+            },
             "tick_latency_ms": round(getattr(self, "_last_tick_latency_ms", 0.0), 1),
             "auto_rotation_enabled": getattr(self.config, "auto_rotation_enabled", True),
             "auto_rotation_interval_minutes": getattr(self.config, "auto_rotation_interval_minutes", 3.0),
@@ -2242,6 +2625,11 @@ class BasisStatArbitrage(StrategyV2Base):
             "active_positions": active_list,
             "closed_trades": all_closed,
             "market_comparison": basis_comparison,
+            "quarantined_tokens": {tok: ts for tok, ts in self.quarantine_tokens.items() if self.current_timestamp < ts},
+            "sniper_prey_tracker": {
+                tok: data for tok, data in self.sniper_prey_tracker.items()
+                if self.current_timestamp - float(data.get("initial_trigger_ts", 0.0)) < int(getattr(self.config, "sniper_max_prey_dwell_seconds", 3600))
+            },
         }
 
         report = {
