@@ -378,6 +378,15 @@ class BasisStatArbitrageConfig(StrategyV2ConfigBase):
             "prompt_on_new": False,
         }
     )
+    single_leg_timeout_seconds: float = Field(
+        default=5.0,
+        ge=1.0,
+        le=30.0,
+        json_schema_extra={
+            "prompt": lambda mi: "Max seconds to wait for both legs to confirm fill before emergency unwind (e.g. 5.0): ",
+            "prompt_on_new": False,
+        }
+    )
     dry_run_virtual_balance_quote: Decimal = Field(
         default=Decimal("0.0"),
         ge=Decimal("0.0"),
@@ -1115,6 +1124,237 @@ class BasisStatArbitrage(StrategyV2Base):
         except Exception:
             return Decimal("0")
 
+    def get_executor_by_id(self, executor_id: str):
+        """Find an active executor by its unique ID across all controllers."""
+        if not hasattr(self, "executor_orchestrator") or not self.executor_orchestrator:
+            return None
+        active_map = getattr(self.executor_orchestrator, "active_executors", {})
+        if isinstance(active_map, dict):
+            for exec_list in active_map.values():
+                if isinstance(exec_list, list):
+                    for ex in exec_list:
+                        if getattr(getattr(ex, "config", None), "id", None) == executor_id:
+                            return ex
+        return None
+
+    def quantize_order_amount(
+        self, token: str, raw_amount: Decimal, p1: Decimal, p2: Decimal
+    ) -> Optional[Decimal]:
+        """
+        Quantizes base coin amount strictly conforming to BOTH perpetual connectors' trading rules.
+        Ensures coin-neutral delta (Delta_base = 0), valid step sizes, and minimum notional on both venues.
+        """
+        if len(self.config.connectors) < 2:
+            return raw_amount
+
+        c1, c2 = list(self.config.connectors)[:2]
+        tp1 = self.get_trading_pair_for_connector(token, c1)
+        tp2 = self.get_trading_pair_for_connector(token, c2)
+
+        conn1 = self.connectors.get(c1)
+        conn2 = self.connectors.get(c2)
+        if not conn1 or not conn2:
+            return raw_amount
+
+        amt = raw_amount
+        try:
+            amt = conn1.quantize_order_amount(tp1, amt)
+            amt = conn2.quantize_order_amount(tp2, amt)
+        except Exception as e:
+            self.logger().debug(f"Error during connector quantize for {token}: {e}")
+
+        # Check trading rules for venue 1 and 2
+        rules1 = getattr(conn1, "trading_rules", {}).get(tp1) if isinstance(getattr(conn1, "trading_rules", None), dict) else None
+        rules2 = getattr(conn2, "trading_rules", {}).get(tp2) if isinstance(getattr(conn2, "trading_rules", None), dict) else None
+
+        min_sz_1 = getattr(rules1, "min_order_size", None)
+        if isinstance(min_sz_1, (Decimal, int, float)) and amt < Decimal(str(min_sz_1)):
+            self.logger().warning(f"🛡️ [LOT-SIZE-INTERCEPT] {token} quantized amount {amt} < min order size {min_sz_1} on {c1}")
+            return None
+
+        min_sz_2 = getattr(rules2, "min_order_size", None)
+        if isinstance(min_sz_2, (Decimal, int, float)) and amt < Decimal(str(min_sz_2)):
+            self.logger().warning(f"🛡️ [LOT-SIZE-INTERCEPT] {token} quantized amount {amt} < min order size {min_sz_2} on {c2}")
+            return None
+
+        min_notional_1 = getattr(rules1, "min_notional_size", None)
+        if isinstance(min_notional_1, (Decimal, int, float)) and amt * p1 < Decimal(str(min_notional_1)):
+            self.logger().warning(f"🛡️ [NOTIONAL-INTERCEPT] {token} notional ${float(amt * p1):.2f} < min notional ${min_notional_1} on {c1}")
+            return None
+
+        min_notional_2 = getattr(rules2, "min_notional_size", None)
+        if isinstance(min_notional_2, (Decimal, int, float)) and amt * p2 < Decimal(str(min_notional_2)):
+            self.logger().warning(f"🛡️ [NOTIONAL-INTERCEPT] {token} notional ${float(amt * p2):.2f} < min notional ${min_notional_2} on {c2}")
+            return None
+
+        # Hard minimum notional floor for Hyperliquid ($10) & Binance ($5)
+        if "hyperliquid" in c1 and amt * p1 < Decimal("10.0"):
+            self.logger().warning(f"🛡️ [NOTIONAL-FLOOR-INTERCEPT] {token} Hyperliquid notional ${float(amt * p1):.2f} < hard floor $10.00")
+            return None
+        if "hyperliquid" in c2 and amt * p2 < Decimal("10.0"):
+            self.logger().warning(f"🛡️ [NOTIONAL-FLOOR-INTERCEPT] {token} Hyperliquid notional ${float(amt * p2):.2f} < hard floor $10.00")
+            return None
+
+        return amt if amt > Decimal("0") else None
+
+    def _evaluate_single_leg_execution_guard(self) -> List[StopExecutorAction]:
+        """
+        ⚡ Real-Money Single-Leg Fill & Execution Rollback Guardian (Case 58).
+        Continuously inspects pending live arbitrage orders:
+        - If both legs fill: transitions status to 'ACTIVE_HEDGED'.
+        - If timeout occurs or one leg fails while the other is filled:
+          IMMEDIATELY cancels/stops both legs, triggering PositionExecutor market close
+          on the filled leg to emergency-unwind naked directional exposure.
+        - If neither leg filled: cleanly aborts and removes position with 0 loss.
+        """
+        guard_stop_actions = []
+        now = self.current_timestamp
+        timeout_sec = float(getattr(self.config, "single_leg_timeout_seconds", 5.0))
+
+        for token, pos in list(self.active_basis_arbitrages.items()):
+            if pos.get("is_virtual", True):
+                continue
+
+            status = pos.get("execution_status", "PENDING_EXECUTION")
+            if status == "ACTIVE_HEDGED":
+                continue
+
+            exec_ids = pos.get("executors_ids", [])
+            if len(exec_ids) < 2:
+                continue
+
+            id1, id2 = exec_ids[0], exec_ids[1]
+            ex1 = self.get_executor_by_id(id1)
+            ex2 = self.get_executor_by_id(id2)
+
+            filled1 = getattr(ex1, "open_filled_amount", Decimal("0")) if ex1 else Decimal("0")
+            filled2 = getattr(ex2, "open_filled_amount", Decimal("0")) if ex2 else Decimal("0")
+            closed1 = getattr(ex1, "is_closed", False) if ex1 else False
+            closed2 = getattr(ex2, "is_closed", False) if ex2 else False
+            elapsed = now - float(pos.get("open_timestamp", now))
+
+            # Case A: Both legs successfully filled!
+            if filled1 > Decimal("0") and filled2 > Decimal("0"):
+                pos["execution_status"] = "ACTIVE_HEDGED"
+                if ex1 and getattr(ex1, "entry_price", None):
+                    pos["entry_price_1"] = float(ex1.entry_price)
+                if ex2 and getattr(ex2, "entry_price", None):
+                    pos["entry_price_2"] = float(ex2.entry_price)
+                pos["amount_1"] = float(filled1)
+                pos["amount_2"] = float(filled2)
+
+                self.logger().info(
+                    f"⚡ [HEDGE-CONFIRMED] Token '{token}' both legs filled successfully!\n"
+                    f"  Leg 1 ({pos['connector_1']}): {float(filled1):.4f} @ ${pos['entry_price_1']:.4f}\n"
+                    f"  Leg 2 ({pos['connector_2']}): {float(filled2):.4f} @ ${pos['entry_price_2']:.4f}\n"
+                    f"  Delta-zero arbitrage confirmed established in {elapsed:.2f}s."
+                )
+                self._persist_state()
+                continue
+
+            # Case B: Timeout elapsed OR one executor has terminated/failed
+            if elapsed >= timeout_sec or closed1 or closed2:
+                # Sub-case B1: Leg 1 filled, Leg 2 FAILED or TIMED OUT
+                if filled1 > Decimal("0") and filled2 == Decimal("0"):
+                    self.logger().critical(
+                        f"🚨 [SINGLE-LEG-EMERGENCY-UNWIND] Token '{token}' naked exposure detected!\n"
+                        f"  Leg 1 ({pos['connector_1']}) filled {float(filled1):.4f} (${float(getattr(ex1, 'open_filled_amount_quote', 0)):.2f}), "
+                        f"but Leg 2 ({pos['connector_2']}) failed/timed out after {elapsed:.1f}s.\n"
+                        f"  UNWINDING Leg 1 immediately with Market Close to eliminate directional risk!"
+                    )
+                    guard_stop_actions.append(StopExecutorAction(executor_id=id2))
+                    guard_stop_actions.append(StopExecutorAction(executor_id=id1))
+
+                    self._archive_emergency_unwind_position(token, pos, "SINGLE_LEG_EMERGENCY_UNWIND_LEG1_FILLED", ex1, ex2)
+                    self.quarantine_tokens[token] = now + 1800.0  # 30-min quarantine
+                    continue
+
+                # Sub-case B2: Leg 2 filled, Leg 1 FAILED or TIMED OUT
+                elif filled2 > Decimal("0") and filled1 == Decimal("0"):
+                    self.logger().critical(
+                        f"🚨 [SINGLE-LEG-EMERGENCY-UNWIND] Token '{token}' naked exposure detected!\n"
+                        f"  Leg 2 ({pos['connector_2']}) filled {float(filled2):.4f} (${float(getattr(ex2, 'open_filled_amount_quote', 0)):.2f}), "
+                        f"but Leg 1 ({pos['connector_1']}) failed/timed out after {elapsed:.1f}s.\n"
+                        f"  UNWINDING Leg 2 immediately with Market Close to eliminate directional risk!"
+                    )
+                    guard_stop_actions.append(StopExecutorAction(executor_id=id1))
+                    guard_stop_actions.append(StopExecutorAction(executor_id=id2))
+
+                    self._archive_emergency_unwind_position(token, pos, "SINGLE_LEG_EMERGENCY_UNWIND_LEG2_FILLED", ex1, ex2)
+                    self.quarantine_tokens[token] = now + 1800.0
+                    continue
+
+                # Sub-case B3: Neither leg filled (Zero Fill Abort)
+                elif filled1 == Decimal("0") and filled2 == Decimal("0"):
+                    self.logger().warning(
+                        f"🛡️ [ENTRY-ABORTED-ZERO-FILL] Token '{token}' neither leg filled within {elapsed:.1f}s. "
+                        f"Cancelling pending executors. Position aborted cleanly with $0.00 loss."
+                    )
+                    guard_stop_actions.append(StopExecutorAction(executor_id=id1))
+                    guard_stop_actions.append(StopExecutorAction(executor_id=id2))
+                    if token in self.active_basis_arbitrages:
+                        del self.active_basis_arbitrages[token]
+                    self.quarantine_tokens[token] = now + 300.0  # 5-min cooldown
+                    self._persist_state()
+                    continue
+
+        return guard_stop_actions
+
+    def _archive_emergency_unwind_position(self, token: str, pos: dict, reason: str, ex1, ex2):
+        """Archive an emergency-unwound single-leg position into stopped trades history."""
+        if token in self.active_basis_arbitrages:
+            del self.active_basis_arbitrages[token]
+
+        fee1 = float(getattr(ex1, "cum_fees_quote", 0.0)) if ex1 else 0.0
+        fee2 = float(getattr(ex2, "cum_fees_quote", 0.0)) if ex2 else 0.0
+        tot_fee = fee1 + fee2
+
+        net_pnl1 = float(getattr(ex1, "net_pnl_quote", 0.0)) if ex1 else 0.0
+        net_pnl2 = float(getattr(ex2, "net_pnl_quote", 0.0)) if ex2 else 0.0
+        tot_net_pnl = net_pnl1 + net_pnl2 - tot_fee
+
+        tot_margin = float(pos.get("total_margin", 1.0))
+        net_roe = (tot_net_pnl / tot_margin) if tot_margin > 0 else 0.0
+
+        p1_close = float(getattr(ex1, "close_price", pos["entry_price_1"])) if ex1 else float(pos["entry_price_1"])
+        p2_close = float(getattr(ex2, "close_price", pos["entry_price_2"])) if ex2 else float(pos["entry_price_2"])
+
+        record = {
+            "token": token,
+            "connector_1": pos["connector_1"],
+            "connector_2": pos["connector_2"],
+            "side_1": pos["side_1"],
+            "side_2": pos["side_2"],
+            "entry_price_1": pos["entry_price_1"],
+            "entry_price_2": pos["entry_price_2"],
+            "close_price_1": p1_close,
+            "close_price_2": p2_close,
+            "entry_basis_pct": pos["entry_basis_pct"],
+            "close_basis_pct": pos["entry_basis_pct"],
+            "captured_basis_pct": 0.0,
+            "captured_basis_bps": 0.0,
+            "position_size": pos["position_size"],
+            "leverage": pos["leverage"],
+            "gross_trading_pnl": net_pnl1 + net_pnl2,
+            "depth_slippage_cost": 0.0,
+            "latency_slippage_cost": 0.0,
+            "trading_fee": tot_fee,
+            "net_trading_pnl": tot_net_pnl,
+            "settled_funding_pnl": 0.0,
+            "total_net_pnl": tot_net_pnl,
+            "net_roe_pct": net_roe,
+            "alpha_retention_pct": 0.0,
+            "close_reason": reason,
+            "open_timestamp": pos["open_timestamp"],
+            "close_timestamp": self.current_timestamp,
+            "duration_seconds": int(self.current_timestamp - pos["open_timestamp"]),
+        }
+
+        if token not in self.stopped_basis_arbitrages:
+            self.stopped_basis_arbitrages[token] = []
+        self.stopped_basis_arbitrages[token].append(record)
+        self._persist_state()
+
     def get_connector_available_collateral(self, connector_name: str, trading_pair: str) -> Tuple[Decimal, str]:
         """
         Query real available margin/collateral for a connector.
@@ -1503,6 +1743,16 @@ class BasisStatArbitrage(StrategyV2Base):
                     if self.config.dry_run:
                         self.active_basis_arbitrages[s_tok] = pos_data
                     else:
+                        quantized_amt = self.quantize_order_amount(s_tok, hedged_amt, s_c1_exec, s_c2_exec)
+                        if not quantized_amt or quantized_amt <= Decimal("0"):
+                            self.logger().warning(
+                                f"🎯 [SNIPER-QUANTIZATION-FAIL] Sizing for '{s_tok}' failed exchange filters (min notional/lot size). Aborting entry."
+                            )
+                            continue
+                        hedged_amt = quantized_amt
+                        pos_data["amount_1"] = float(hedged_amt)
+                        pos_data["amount_2"] = float(hedged_amt)
+
                         pos_cfg_1 = PositionExecutorConfig(
                             timestamp=self.current_timestamp, connector_name=c1,
                             trading_pair=tp1, side=s_c1_side, entry_price=s_c1_exec,
@@ -1516,6 +1766,7 @@ class BasisStatArbitrage(StrategyV2Base):
                             triple_barrier_config=TripleBarrierConfig(open_order_type=OrderType.MARKET),
                         )
                         pos_data["is_virtual"] = False
+                        pos_data["execution_status"] = "PENDING_EXECUTION"
                         pos_data["executors_ids"] = [pos_cfg_1.id, pos_cfg_2.id]
                         self.active_basis_arbitrages[s_tok] = pos_data
                         create_actions.extend([CreateExecutorAction(executor_config=pos_cfg_1), CreateExecutorAction(executor_config=pos_cfg_2)])
@@ -1808,6 +2059,17 @@ class BasisStatArbitrage(StrategyV2Base):
             # Sized using the higher price leg so neither leg exceeds position_size_quote
             max_exec_p = max(c1_exec_price, c2_exec_price)
             hedged_amount = pos_size / max_exec_p if max_exec_p > 0 else Decimal("0")
+
+            if not self.config.dry_run:
+                quantized_amt = self.quantize_order_amount(token, hedged_amount, c1_exec_price, c2_exec_price)
+                if not quantized_amt or quantized_amt <= Decimal("0"):
+                    self.logger().warning(
+                        f"🛡️ [BASIS-QUANTIZATION-FAIL] Sizing for '{token}' failed exchange filters (min notional/lot size). Aborting entry."
+                    )
+                    self.entry_candidate_ticks[token] = 0
+                    continue
+                hedged_amount = quantized_amt
+
             c1_amount = hedged_amount
             c2_amount = hedged_amount
 
@@ -1916,6 +2178,7 @@ class BasisStatArbitrage(StrategyV2Base):
                     triple_barrier_config=TripleBarrierConfig(open_order_type=OrderType.MARKET),
                 )
                 pos_data["is_virtual"] = False
+                pos_data["execution_status"] = "PENDING_EXECUTION"
                 pos_data["executors_ids"] = [pos_cfg_1.id, pos_cfg_2.id]
                 self.active_basis_arbitrages[token] = pos_data
                 create_actions.extend([CreateExecutorAction(executor_config=pos_cfg_1), CreateExecutorAction(executor_config=pos_cfg_2)])
@@ -1925,6 +2188,7 @@ class BasisStatArbitrage(StrategyV2Base):
     def stop_actions_proposal(self) -> List[StopExecutorAction]:
         """
         Evaluate exit conditions for active basis arbitrage positions:
+        0. Real-Money Single-Leg Fill & Rollback Guardian (Case 58)
         1. Basis Compression Take-Profit (均值回归压平)
         2. Net Profit Ratio Target Take-Profit (综合净收益达标)
         3. Trailing Take-Profit (利润回撤锁定)
@@ -1934,7 +2198,17 @@ class BasisStatArbitrage(StrategyV2Base):
         stop_actions = []
         tokens_to_close = []
 
+        # 0. Live Real-Money Single-Leg Fill & Rollback Guardian
+        if not self.config.dry_run:
+            guard_actions = self._evaluate_single_leg_execution_guard()
+            if guard_actions:
+                stop_actions.extend(guard_actions)
+
         for token, pos in list(self.active_basis_arbitrages.items()):
+            # If real position is still waiting for fills, skip normal exit evaluation
+            if not pos.get("is_virtual", True) and pos.get("execution_status") == "PENDING_EXECUTION":
+                continue
+
             c1 = pos["connector_1"]
             c2 = pos["connector_2"]
             tp1 = self.get_trading_pair_for_connector(token, c1)

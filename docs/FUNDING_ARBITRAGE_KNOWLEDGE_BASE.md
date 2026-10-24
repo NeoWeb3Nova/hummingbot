@@ -1820,6 +1820,20 @@ $$Size_{quote} = \min\left(Size_{target}, \sum_{k=1}^{25} (P_k \times Q_k)_{c1} 
   5. **单腿成交熔断回滚守护 (Single-Leg Rollback Guard)**：
      - 在执行器调度器中监控两腿状态，若 2000ms 内一腿成功一腿被拒，立即向已成交腿发出市价反向平仓单，杜绝单腿裸奔。
 
+- **代码加固与生产防线落地完成 (Code Implementation Complete)**：
+  1. **交易所规则与精度量化引擎 (`quantize_order_amount`)**：
+     - 双边统一向下截断至最严苛 `step_size`，确保 $\Delta_{base} = 0.00000000$ 绝对币本位对齐；
+     - 双边名义价值校验，硬性强制拦截 Hyperliquid $< \$10.0$ 与 Binance $< \$5.0$ 的报单，杜绝交易所报错拒单。
+  2. **毫秒级单腿成交熔断回滚守护 (`_evaluate_single_leg_execution_guard`)**：
+     - 在 `stop_actions_proposal` 顶层常驻挂载；
+     - 双腿均成交：秒级标定 `ACTIVE_HEDGED`，以交易所实际成交均价更新入场基差；
+     - 单腿成交异常（超时 5 秒或对手腿失败）：立即对已成交腿发出 `StopExecutorAction`（市价强平），彻底消灭裸方向风险，并将标的隔离 30 分钟；
+     - 双腿零成交：直接清理归集为 `ZERO_FILL_ENTRY_ABORT`，实现 $0.00 零磨损退出。
+  3. **失败交易全维归集与落盘 (`_archive_emergency_unwind_position`)**：
+     - 单腿熔断损失严格计入 `stopped_basis_arbitrages`，无缝透传至前端 Streamlit 的“🛑 真实平仓失败归集看板”与瀑布流图表。
+  4. **回归单元测试保障**：
+     - `test_basis_stat_arb.py` 扩展至 18 个全覆盖测试用例（包括精度截断、两腿全成、Leg 1 熔断、Leg 2 熔断与零成退单），18/18 用例 100% 通过。
+
 - **落地 SOP 三步走路线图**：
   - **阶段一（当前已达成）**：Paper 模拟盘（$1,000 虚拟本金，48 个代币池，验证基差收敛与 60s 防噪锁定理）；
   - **阶段二（关键过渡）**：微额影子实盘（Micro-Live，双边本金各 $50~$100，单笔货值 $15，仅跑 SOL/ETH 主流标的，跑满 20 笔真实对账）；
